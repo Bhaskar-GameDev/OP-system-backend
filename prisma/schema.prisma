@@ -1,0 +1,230 @@
+// Patient Flow OS — Prisma schema
+// Mirrors the binding schema spec. snake_case columns/tables via @map/@@map.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Enums ────────────────────────────────────────────────
+
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+}
+
+enum StaffRole {
+  RECEPTIONIST
+  DOCTOR
+  ADMIN
+}
+
+// Where a booking originated. Source of truth for filtering/analytics —
+// NEVER derive this from the token prefix. APP and VOICE intentionally share
+// the "A" token prefix, so prefix-parsing cannot distinguish them.
+enum BookingSource {
+  APP
+  WALK_IN
+  VOICE
+}
+
+// Consultation session slot a booking belongs to (per doctor per date).
+enum SessionType {
+  MORNING
+  EVENING
+}
+
+enum BookingStatus {
+  PENDING_PAYMENT // created, awaiting payment — NO token yet
+  BOOKED // payment success, token issued, waiting in queue
+  ACTIVE // currently being consulted
+  COMPLETED // doctor pressed DONE
+  NO_SHOW // did not arrive
+  CANCELLED // cancelled (may carry refund)
+}
+
+enum PaymentStatus {
+  CREATED
+  SUCCESS
+  FAILED
+  REFUNDED
+}
+
+// ─── Models ───────────────────────────────────────────────
+
+model Patient {
+  id        String   @id @default(uuid())
+  name      String
+  mobile    String   @unique
+  age       Int?
+  gender    Gender?
+  // FCM device token for push (captured at login/app-open). Single device, V1.
+  fcmToken  String?  @map("fcm_token")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  bookings Booking[]
+
+  @@index([mobile])
+  @@map("patients")
+}
+
+model Clinic {
+  id            String @id @default(uuid())
+  name          String
+  address       String?
+  contactNumber String? @map("contact_number")
+
+  doctors Doctor[]
+  staff   Staff[]
+
+  @@map("clinics")
+}
+
+model Doctor {
+  id               String @id @default(uuid())
+  clinicId         String @map("clinic_id")
+  name             String
+  specialization   String?
+  consultationFee  Int    @default(0) @map("consultation_fee")
+  avgConsultMinutes Int   @default(10) @map("avg_consult_minutes")
+
+  // login (username/password) — bcrypt hash, never plaintext
+  username     String? @unique
+  passwordHash String? @map("password_hash")
+
+  clinic        Clinic         @relation(fields: [clinicId], references: [id])
+  bookings      Booking[]
+  queueSessions QueueSession[]
+
+  @@index([clinicId])
+  @@map("doctors")
+}
+
+model Staff {
+  id               String    @id @default(uuid())
+  clinicId         String    @map("clinic_id")
+  name             String
+  role             StaffRole
+  username         String?   @unique
+  loginCredentials String    @map("login_credentials") // bcrypt password hash — never plaintext
+
+  clinic Clinic @relation(fields: [clinicId], references: [id])
+
+  @@index([clinicId])
+  @@map("staff")
+}
+
+model Booking {
+  id          String        @id @default(uuid())
+  patientId   String        @map("patient_id")
+  doctorId    String        @map("doctor_id")
+  source      BookingSource @map("source") // truth for analytics/filtering — not derived from prefix
+  tokenNumber String?       @map("token_number") // display only: "A001" (app/voice) / "W001" (walk-in) — null until payment success
+  sessionDate DateTime      @map("session_date") @db.Date
+  sessionType SessionType   @map("session_type")
+  status      BookingStatus @default(PENDING_PAYMENT)
+  paymentId   String?       @unique @map("payment_id")
+  createdAt   DateTime      @default(now()) @map("created_at")
+
+  // Consultation timestamps — captured live by the queue-advance flow.
+  // (Required by spec "Consultation Timestamps"; no later point can recover them.)
+  consultationStartedAt DateTime? @map("consultation_started_at") // set when promoted to ACTIVE (rank 0)
+  consultationEndedAt   DateTime? @map("consultation_ended_at") // set on DONE (-> COMPLETED)
+
+  // Physical arrival at the clinic — purely informational, SEPARATE from queue
+  // position / no-show. arrived = checkedInAt != null. Never drives Redis.
+  checkedInAt           DateTime? @map("checked_in_at")
+
+  patient Patient  @relation(fields: [patientId], references: [id])
+  doctor  Doctor   @relation(fields: [doctorId], references: [id])
+  payment Payment? @relation(fields: [paymentId], references: [id])
+
+  // token unique within a doctor's session (only when issued)
+  @@unique([doctorId, sessionDate, sessionType, tokenNumber], name: "uq_token_per_session")
+  @@index([doctorId, sessionDate, sessionType])
+  @@index([patientId])
+  @@map("bookings")
+}
+
+model Payment {
+  id         String        @id @default(uuid())
+  bookingId        String        @map("booking_id")
+  amount           Int
+  status           PaymentStatus @default(CREATED)
+  gatewayRef       String?       @map("gateway_ref")
+  razorpayOrderId  String?       @unique @map("razorpay_order_id") // set at order creation
+  razorpayPaymentId String?      @unique @map("razorpay_payment_id") // set on confirm; dedup key
+  razorpayRefundId String?       @map("razorpay_refund_id") // set on cancel/refund — audit trail
+  createdAt        DateTime      @default(now()) @map("created_at")
+
+  booking Booking?
+
+  @@index([bookingId])
+  @@map("payments")
+}
+
+// Live ordered queue per doctor per session.
+// Ordering itself is held in Redis (sorted set) — this row is the durable
+// session record + metadata. Reordering (walk-in insert, emergency priority)
+// happens against the Redis structure keyed by this session.
+model QueueSession {
+  id              String      @id @default(uuid())
+  doctorId        String      @map("doctor_id")
+  sessionDate     DateTime    @map("session_date") @db.Date
+  sessionType     SessionType @map("session_type")
+  activeBookingId String?     @map("active_booking_id") // booking currently being consulted
+  isOpen          Boolean     @default(true) @map("is_open")
+  createdAt       DateTime    @default(now()) @map("created_at")
+  updatedAt       DateTime    @updatedAt @map("updated_at")
+
+  doctor Doctor @relation(fields: [doctorId], references: [id])
+
+  @@unique([doctorId, sessionDate, sessionType], name: "uq_session")
+  @@index([doctorId])
+  @@map("queue_sessions")
+}
+
+// Append-only mirror of completed bookings. Written ONLY by the archival job.
+// No updates/deletes outside that job — permanent retention.
+model BookingHistory {
+  id             String        @id @default(uuid())
+  bookingId      String        @unique @map("booking_id")
+  patientId      String        @map("patient_id")
+  doctorId       String        @map("doctor_id")
+  clinicId       String        @map("clinic_id")
+  source         BookingSource @map("source") // mirrored from booking — analytics truth
+  tokenNumber    String?       @map("token_number")
+  sessionDate    DateTime      @map("session_date") @db.Date
+  sessionType    SessionType   @map("session_type")
+  finalStatus    BookingStatus @map("final_status")
+  paymentAmount  Int?          @map("payment_amount")
+  paymentStatus  PaymentStatus? @map("payment_status")
+  paymentRef     String?       @map("payment_ref")
+  bookedAt              DateTime  @map("booked_at")
+  consultationStartedAt DateTime? @map("consultation_started_at")
+  consultationEndedAt   DateTime? @map("consultation_ended_at")
+  archivedAt            DateTime  @default(now()) @map("archived_at")
+
+  @@index([clinicId, sessionDate])
+  @@index([patientId])
+  @@map("booking_history")
+}
+
+model AnalyticsDaily {
+  id             String   @id @default(uuid())
+  clinicId       String   @map("clinic_id")
+  date           DateTime @db.Date
+  patientsSeen   Int      @default(0) @map("patients_seen")
+  avgWaitTime    Int      @default(0) @map("avg_wait_time") // minutes
+  avgConsultTime Int      @default(0) @map("avg_consult_time") // minutes
+  noShows        Int      @default(0) @map("no_shows")
+
+  @@unique([clinicId, date], name: "uq_clinic_day")
+  @@index([clinicId])
+  @@map("analytics_daily")
+}

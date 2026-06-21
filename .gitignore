@@ -1,0 +1,26 @@
+# dependencies
+/node_modules
+
+# build
+/dist
+/build
+
+# env / secrets — NEVER commit real secrets
+.env
+.env.local
+.env.*.local
+
+# logs
+*.log
+npm-debug.log*
+
+# test coverage
+/coverage
+
+# prisma local
+prisma/*.db
+
+# editor / os
+.DS_Store
+.idea
+*.swp
