@@ -99,7 +99,14 @@ export class NotificationsService implements OnModuleInit, OnModuleDestroy {
       {
         title: 'Booking confirmed',
         body: `Your token ${booking.tokenNumber} is confirmed.`,
-        data: { type: NotificationType.BOOKING_CONFIRMED, bookingId, token: booking.tokenNumber },
+        data: {
+          type: NotificationType.BOOKING_CONFIRMED,
+          bookingId,
+          token: booking.tokenNumber,
+          doctorId: session.doctorId,
+          sessionDate: session.sessionDate,
+          sessionType: session.sessionType,
+        },
       },
     );
   }
@@ -144,12 +151,28 @@ export class NotificationsService implements OnModuleInit, OnModuleDestroy {
         ? {
             title: 'You are next',
             body: `Token ${token} — please be ready, your turn is coming up.`,
-            data: { type, token, bookingId, patientsAhead: String(patientsAhead) },
+            data: {
+              type,
+              token,
+              bookingId,
+              patientsAhead: String(patientsAhead),
+              doctorId: session.doctorId,
+              sessionDate: session.sessionDate,
+              sessionType: session.sessionType,
+            },
           }
         : {
             title: 'Your turn is approaching',
             body: `Token ${token} — ${patientsAhead} ahead of you.`,
-            data: { type, token, bookingId, patientsAhead: String(patientsAhead) },
+            data: {
+              type,
+              token,
+              bookingId,
+              patientsAhead: String(patientsAhead),
+              doctorId: session.doctorId,
+              sessionDate: session.sessionDate,
+              sessionType: session.sessionType,
+            },
           };
 
     await this.deliverOnce(type, session, token, fcm, token, message);
