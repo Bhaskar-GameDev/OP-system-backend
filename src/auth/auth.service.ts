@@ -4,11 +4,13 @@ import { PrismaService } from '../common/prisma/prisma.service';
 import { AuthTokenService, Role } from './auth-token.service';
 import { OtpService } from './otp.service';
 import { PasswordService } from './password.service';
+import { RefreshTokenService } from './refresh-token.service';
 
 export interface AuthResult {
   token: string;
   role: Role;
   sub: string;
+  refreshToken?: string;
 }
 
 /**
@@ -23,6 +25,7 @@ export class AuthService {
     private readonly tokens: AuthTokenService,
     private readonly otp: OtpService,
     private readonly passwords: PasswordService,
+    private readonly refresh: RefreshTokenService,
   ) {}
 
   // ── patient OTP ──────────────────────────────────────────
@@ -30,7 +33,10 @@ export class AuthService {
     return this.otp.requestOtp(mobile);
   }
 
-  /** Verify OTP, upsert the patient by mobile, issue a PATIENT token. */
+  /**
+   * Verify OTP, upsert the patient by mobile, issue a short-lived PATIENT
+   * access token plus a long-lived rotating refresh token.
+   */
   async verifyPatientOtp(mobile: string, code: string): Promise<AuthResult> {
     await this.otp.verifyOtp(mobile, code); // throws on failure/lockout
 
@@ -41,7 +47,32 @@ export class AuthService {
     });
 
     const token = this.tokens.sign({ sub: patient.id, role: 'PATIENT' });
-    return { token, role: 'PATIENT', sub: patient.id };
+    const refreshToken = await this.refresh.issue(patient.id);
+    return { token, refreshToken, role: 'PATIENT', sub: patient.id };
+  }
+
+  /**
+   * Exchange a valid refresh token for a new access token (and a rotated
+   * refresh token). The app calls this transparently when its access token
+   * expires, so the patient never re-enters an OTP until the refresh token
+   * itself lapses (30d) or is revoked.
+   */
+  async refreshPatientSession(
+    refreshToken: string,
+  ): Promise<{ token: string; refreshToken: string }> {
+    const { sub, refreshToken: rotated } =
+      await this.refresh.verifyAndRotate(refreshToken);
+
+    const patient = await this.prisma.patient.findUnique({ where: { id: sub } });
+    if (!patient) throw new UnauthorizedException('account no longer exists');
+
+    const token = this.tokens.sign({ sub, role: 'PATIENT' });
+    return { token, refreshToken: rotated };
+  }
+
+  /** Revoke a refresh token (logout). Idempotent. */
+  async logoutPatient(refreshToken: string): Promise<void> {
+    await this.refresh.revoke(refreshToken);
   }
 
   // ── staff login (username/password) ──────────────────────

@@ -61,11 +61,42 @@ async function main(): Promise<void> {
     },
   });
 
+  // ── Extra clinics + doctors for patient app discovery ──────────────────────
+  const APOLLO_ID  = '00000000-0000-0000-0000-000000000010';
+  const FORTIS_ID  = '00000000-0000-0000-0000-000000000011';
+
+  await prisma.clinic.upsert({
+    where: { id: APOLLO_ID },
+    update: {},
+    create: { id: APOLLO_ID, name: 'Apollo Hospitals', address: '21 Greams Lane, Chennai', contactNumber: '+91-44-28293333' },
+  });
+
+  await prisma.clinic.upsert({
+    where: { id: FORTIS_ID },
+    update: {},
+    create: { id: FORTIS_ID, name: 'Fortis Healthcare', address: '14 Cunningham Road, Bangalore', contactNumber: '+91-80-66214444' },
+  });
+
+  const drPriya = await bcrypt.hash('doctor123', 12);
+  await prisma.doctor.upsert({
+    where: { id: '00000000-0000-0000-0000-000000000020' },
+    update: {},
+    create: { id: '00000000-0000-0000-0000-000000000020', clinicId: APOLLO_ID, name: 'Dr. Priya Ramesh', specialization: 'Cardiology', consultationFee: 800, avgConsultMinutes: 10, username: 'priya.ramesh', passwordHash: drPriya },
+  });
+
+  const drArun = await bcrypt.hash('doctor123', 12);
+  await prisma.doctor.upsert({
+    where: { id: '00000000-0000-0000-0000-000000000021' },
+    update: {},
+    create: { id: '00000000-0000-0000-0000-000000000021', clinicId: FORTIS_ID, name: 'Dr. Sunita Verma', specialization: 'Dermatology', consultationFee: 600, avgConsultMinutes: 8, username: 'sunita.verma', passwordHash: drArun },
+  });
+
   console.log('Seed complete:');
   console.log('  clinicId =', CLINIC_ID);
   console.log('  doctorId =', DOCTOR_ID);
   console.log('  receptionist  reception / reception123');
   console.log('  doctor        drsmith / doctor123');
+  console.log('  + Apollo Hospitals, Fortis Healthcare, Dr. Priya Ramesh, Dr. Sunita Verma');
 }
 
 main()

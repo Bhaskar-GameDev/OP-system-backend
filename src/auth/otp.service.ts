@@ -84,7 +84,8 @@ export class OtpService {
       );
     }
 
-    const otp = String(randomInt(0, 1_000_000)).padStart(6, '0');
+    const devMode = !this.config.get<string>('MSG91_AUTH_KEY');
+    const otp = devMode ? '000000' : String(randomInt(0, 1_000_000)).padStart(6, '0');
     // store only the hash; reset attempts for the new code
     await redis.set(this.otpKey(mobile), this.hashOtp(otp), 'EX', this.ttl());
     await redis.del(this.attemptsKey(mobile));

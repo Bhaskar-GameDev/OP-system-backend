@@ -1,6 +1,7 @@
 import { Global, Module } from '@nestjs/common';
 import { AuthTokenService } from './auth-token.service';
 import { AuthService } from './auth.service';
+import { RefreshTokenService } from './refresh-token.service';
 import { OtpService } from './otp.service';
 import { PasswordService } from './password.service';
 import { Msg91SmsSender, SMS_SENDER } from './sms.sender';
@@ -16,6 +17,7 @@ import { AuthController } from './auth.controller';
   providers: [
     AuthTokenService,
     AuthService,
+    RefreshTokenService,
     OtpService,
     PasswordService,
     JwtAuthGuard,

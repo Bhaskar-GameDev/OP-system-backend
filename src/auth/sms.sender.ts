@@ -22,8 +22,7 @@ export class Msg91SmsSender implements SmsSender {
   async sendOtp(mobile: string, otp: string): Promise<void> {
     const authKey = this.config.get<string>('MSG91_AUTH_KEY');
     if (!authKey) {
-      // never log the OTP itself in real deployments; dev-only convenience
-      this.logger.warn(`MSG91 not configured; would send OTP to ${mobile}`);
+      this.logger.warn(`[DEV] OTP for ${mobile}: ${otp}`);
       return;
     }
     // TODO: real MSG91 HTTP request (template + sender id from config).

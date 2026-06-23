@@ -32,6 +32,20 @@ export class AuthController {
     return this.auth.verifyPatientOtp(body.mobile, body.otp);
   }
 
+  @Post('patient/refresh')
+  async refreshPatient(@Body() body: { refreshToken?: string }) {
+    if (!body?.refreshToken) {
+      throw new BadRequestException('refreshToken is required');
+    }
+    return this.auth.refreshPatientSession(body.refreshToken);
+  }
+
+  @Post('patient/logout')
+  async logoutPatient(@Body() body: { refreshToken?: string }) {
+    if (body?.refreshToken) await this.auth.logoutPatient(body.refreshToken);
+    return { ok: true };
+  }
+
   @Post('staff/login')
   async staffLogin(@Body() body: LoginDto) {
     if (!body?.username || !body?.password) {
