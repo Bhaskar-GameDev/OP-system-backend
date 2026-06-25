@@ -91,8 +91,109 @@ async function main(): Promise<void> {
     create: { id: '00000000-0000-0000-0000-000000000021', clinicId: FORTIS_ID, name: 'Dr. Sunita Verma', specialization: 'Dermatology', consultationFee: 600, avgConsultMinutes: 8, username: 'sunita.verma', passwordHash: drArun },
   });
 
+  // ── Voice agent demo: City Care Hospital, Kadapa + multilingual doctors ─────
+  // The standalone voice agent resolves this clinic either by the dialed DID
+  // (voiceDid) or via VOICE_DEFAULT_CLINIC_ID. specialtyAliases carry the
+  // English/Telugu/Hindi colloquial terms the agent matches against.
+  const CITY_CARE_ID = '00000000-0000-0000-0000-000000000100';
+
+  await prisma.clinic.upsert({
+    where: { id: CITY_CARE_ID },
+    update: { voiceDid: '+918000000000' },
+    create: {
+      id: CITY_CARE_ID,
+      name: 'City Care Hospital',
+      address: 'Kadapa, Andhra Pradesh',
+      contactNumber: '+918000000000',
+      voiceDid: '+918000000000', // the Vobiz DID patients call
+    },
+  });
+
+  const voiceDoctors: Array<{
+    id: string;
+    name: string;
+    specialization: string;
+    avgConsultMinutes: number;
+    aliases: string[];
+  }> = [
+    {
+      id: '00000000-0000-0000-0000-000000000101',
+      name: 'Dr. Kumar',
+      specialization: 'Dermatology',
+      avgConsultMinutes: 15,
+      aliases: ['skin doctor', 'skin specialist', 'చర్మ వైద్యుడు', 'त्वचा विशेषज्ञ'],
+    },
+    {
+      id: '00000000-0000-0000-0000-000000000102',
+      name: 'Dr. Lakshmi',
+      specialization: 'General Medicine',
+      avgConsultMinutes: 10,
+      aliases: ['general doctor', 'physician', 'సాధారణ వైద్యుడు', 'जनरल डॉक्टर'],
+    },
+    {
+      id: '00000000-0000-0000-0000-000000000103',
+      name: 'Dr. Rajesh',
+      specialization: 'Cardiology',
+      avgConsultMinutes: 20,
+      aliases: ['heart doctor', 'హృదయ వైద్యుడు', 'दिल का डॉक्टर'],
+    },
+    {
+      id: '00000000-0000-0000-0000-000000000104',
+      name: 'Dr. Priya',
+      specialization: 'Gynecology',
+      avgConsultMinutes: 15,
+      aliases: ['lady doctor', 'gynecologist', 'స్త్రీ వైద్యుడు', 'महिला डॉक्टर'],
+    },
+    {
+      id: '00000000-0000-0000-0000-000000000105',
+      name: 'Dr. Suresh',
+      specialization: 'Pediatrics',
+      avgConsultMinutes: 15,
+      aliases: ['children doctor', 'child specialist', 'పిల్లల డాక్టర్', 'बच्चों का डॉक्टर'],
+    },
+    {
+      id: '00000000-0000-0000-0000-000000000106',
+      name: 'Dr. Anand',
+      specialization: 'Orthopedics',
+      avgConsultMinutes: 20,
+      aliases: ['bone doctor', 'ఎముకల డాక్టర్', 'हड्डी का डॉक्टर'],
+    },
+    {
+      id: '00000000-0000-0000-0000-000000000107',
+      name: 'Dr. Meena',
+      specialization: 'Ophthalmology',
+      avgConsultMinutes: 15,
+      aliases: ['eye doctor', 'కంటి డాక్టర్', 'आंखों का डॉक्टर'],
+    },
+    {
+      id: '00000000-0000-0000-0000-000000000108',
+      name: 'Dr. Venkat',
+      specialization: 'Dentistry',
+      avgConsultMinutes: 20,
+      aliases: ['teeth doctor', 'dentist', 'పంటి డాక్టర్', 'दांतों का डॉक्टर'],
+    },
+  ];
+
+  for (const d of voiceDoctors) {
+    await prisma.doctor.upsert({
+      where: { id: d.id },
+      update: { specialtyAliases: d.aliases, specialization: d.specialization },
+      create: {
+        id: d.id,
+        clinicId: CITY_CARE_ID,
+        name: d.name,
+        specialization: d.specialization,
+        specialtyAliases: d.aliases,
+        consultationFee: 400,
+        avgConsultMinutes: d.avgConsultMinutes,
+      },
+    });
+  }
+
   console.log('Seed complete:');
   console.log('  clinicId =', CLINIC_ID);
+  console.log('  voice demo: City Care Hospital =', CITY_CARE_ID, '(DID +918000000000)');
+  console.log('  -> set VOICE_DEFAULT_CLINIC_ID =', CITY_CARE_ID);
   console.log('  doctorId =', DOCTOR_ID);
   console.log('  receptionist  reception / reception123');
   console.log('  doctor        drsmith / doctor123');

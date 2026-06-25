@@ -78,9 +78,13 @@ model Clinic {
   name          String
   address       String?
   contactNumber String? @map("contact_number")
+  // Vobiz DID (the phone number patients call). Lets the voice agent resolve
+  // which clinic a call belongs to from the dialed number. Additive, optional.
+  voiceDid      String? @unique @map("voice_did")
 
-  doctors Doctor[]
-  staff   Staff[]
+  doctors  Doctor[]
+  staff    Staff[]
+  callLogs CallLog[]
 
   @@map("clinics")
 }
@@ -90,6 +94,10 @@ model Doctor {
   clinicId         String @map("clinic_id")
   name             String
   specialization   String?
+  // Colloquial / multilingual aliases for the voice agent's specialty matching
+  // (e.g. ["skin doctor", "చర్మ వైద్యుడు", "त्वचा विशेषज्ञ"]). Additive — the
+  // canonical truth remains `specialization`. Empty for non-voice doctors.
+  specialtyAliases String[] @default([]) @map("specialty_aliases")
   consultationFee  Int    @default(0) @map("consultation_fee")
   avgConsultMinutes Int   @default(10) @map("avg_consult_minutes")
 
@@ -213,6 +221,31 @@ model BookingHistory {
   @@index([clinicId, sessionDate])
   @@index([patientId])
   @@map("booking_history")
+}
+
+// Full record of a voice-agent phone call. Written by the standalone voice
+// agent (via the internal Voice API) when a call ends — for debugging, QA, and
+// improving the agent. Independent of the booking lifecycle: a call may end
+// with no booking (abandoned / failed / informational).
+model CallLog {
+  id          String   @id @default(uuid())
+  callSid     String   @unique @map("call_sid") // Vobiz call SID
+  clinicId    String?  @map("clinic_id") // resolved from the dialed DID (nullable if unknown)
+  callerPhone String   @map("caller_phone")
+  didNumber   String   @map("did_number") // which DID was dialed
+  language    String? // detected language: "en" | "te" | "hi"
+  transcript  Json? // full turn-by-turn transcript [{ role, text, ts }]
+  slots       Json? // final extracted slots snapshot
+  bookingId   String?  @map("booking_id") // booking created on this call, if any
+  outcome     String? // "booked" | "cancelled" | "rescheduled" | "abandoned" | "failed"
+  duration    Int? // call duration in seconds
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  clinic Clinic? @relation(fields: [clinicId], references: [id])
+
+  @@index([clinicId, createdAt])
+  @@index([callerPhone])
+  @@map("call_logs")
 }
 
 model AnalyticsDaily {

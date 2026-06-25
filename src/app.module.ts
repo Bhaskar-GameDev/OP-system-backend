@@ -12,6 +12,7 @@ import { ArchivalModule } from './archival/archival.module';
 import { DiscoveryModule } from './discovery/discovery.module';
 import { AdminModule } from './admin/admin.module';
 import { ReceptionModule } from './reception/reception.module';
+import { VoiceModule } from './voice/voice.module';
 
 @Module({
   imports: [
@@ -28,6 +29,7 @@ import { ReceptionModule } from './reception/reception.module';
     DiscoveryModule,
     AdminModule,
     ReceptionModule,
+    VoiceModule,
   ],
 })
 export class AppModule {}
