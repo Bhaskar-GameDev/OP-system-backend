@@ -114,8 +114,8 @@ describe('Cancellation + same-day booking (real Redis + Postgres)', () => {
 
     await prisma.clinic.upsert({
       where: { id: CLINIC_ID },
-      create: { id: CLINIC_ID, name: 'CX Clinic', cancellationCutoffMinutes: 30 },
-      update: { cancellationCutoffMinutes: 30 },
+      create: { id: CLINIC_ID, name: 'CX Clinic' },
+      update: {},
     });
     await prisma.doctor.upsert({
       where: { id: DOCTOR_ID },
@@ -259,10 +259,8 @@ describe('Cancellation + same-day booking (real Redis + Postgres)', () => {
     await book(pA);
     const b = await book(pB);
 
-    // Absurd cutoff would have blocked under the old rule. Cutoff is gone — a
-    // still-waiting (BOOKED) booking cancels no matter how close to start.
-    await prisma.clinic.update({ where: { id: CLINIC_ID }, data: { cancellationCutoffMinutes: 100000 } });
-
+    // The old rule would have blocked this (the session starts imminently). The
+    // time cutoff is gone — a still-waiting (BOOKED) booking cancels regardless.
     const res = await actions.cancel(actor(pB), b.bookingId);
     expect(res.status).toBe('CANCELLED');
     expect((await prisma.booking.findUniqueOrThrow({ where: { id: b.bookingId } })).status).toBe(BookingStatus.CANCELLED);

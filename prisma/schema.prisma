@@ -98,13 +98,6 @@ model Clinic {
   address       String?
   contactNumber String? @map("contact_number")
 
-  // DEPRECATED (unused): was the cancel/reschedule cutoff — no cancel within N
-  // minutes of session start. Removed with same-day booking (it created a dead
-  // end: a patient joining near session start could never self-cancel). Cancel
-  // eligibility is now the status gate alone. Column retained to avoid a
-  // migration; no code reads it. No admin UI ever exposed it.
-  cancellationCutoffMinutes Int @default(30) @map("cancellation_cutoff_minutes")
-
   hospital     Hospital      @relation(fields: [hospitalId], references: [id])
   doctors      Doctor[]
   staff        Staff[]
@@ -249,12 +242,9 @@ model Booking {
   paymentId   String?       @unique @map("payment_id")
   createdAt   DateTime      @default(now()) @map("created_at")
 
-  // Patient-initiated cancellation / rescheduling.
+  // Patient-initiated cancellation.
   cancellationReason    String? @map("cancellation_reason") // optional free-text from the patient
   refundStatus          String? @map("refund_status") // razorpay refund state: pending | processed | failed
-  // When this booking was created by rescheduling another, points at the old
-  // (now CANCELLED) booking — links the two legs for a clean audit trail.
-  rescheduleOfBookingId String? @map("reschedule_of_booking_id")
 
   // Consultation timestamps — captured live by the queue-advance flow.
   // (Required by spec "Consultation Timestamps"; no later point can recover them.)
