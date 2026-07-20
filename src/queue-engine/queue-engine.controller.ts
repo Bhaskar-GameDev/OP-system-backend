@@ -14,6 +14,7 @@ import { AuthedRequest, JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { SessionClaims } from '../auth/auth-token.service';
 import { RolesGuard } from '../auth/roles.guard';
 import { Roles } from '../auth/roles.decorator';
+import { TenantService } from '../common/tenant/tenant.service';
 import { TokenSource } from './token.service';
 import { QueueService } from './queue.service';
 import { EtaService } from './eta.service';
@@ -30,6 +31,11 @@ import { IssueTokenDto } from './dto/issue-token.dto';
  * path that first creates the Booking: app bookings via payment-confirm, walk-ins
  * via POST /reception/walkins. Both reuse ConsultationService.enqueueBooking,
  * which also broadcasts the live update.
+ *
+ * SCOPE: `doctorId` (and `bookingId`) arrive from the request, so EVERY route
+ * gates on `TenantService.assertQueueAccess` before touching the queue — a DOCTOR
+ * may only act on their own queue, STAFF on their clinic, ADMIN on their hospital.
+ * Role alone is not authorization here.
  */
 @Controller('queue')
 @UseGuards(JwtAuthGuard, RolesGuard)
@@ -40,16 +46,19 @@ export class QueueEngineController {
     private readonly etaService: EtaService,
     private readonly consultationService: ConsultationService,
     private readonly audit: AuditService,
+    private readonly tenant: TenantService,
   ) {}
 
   @Get('position')
   async position(
+    @Req() req: AuthedRequest,
     @Query('doctorId') doctorId: string,
     @Query('sessionDate') sessionDate: string,
     @Query('sessionType') sessionType: string,
     @Query('token') token: string,
   ) {
     const session = this.queryToSession(doctorId, sessionDate, sessionType);
+    await this.tenant.assertQueueAccess(req.user, doctorId);
     if (!token) throw new BadRequestException('token is required');
     const pos = await this.queueService.positionOf(token, session);
     if (!pos) throw new NotFoundException(`token ${token} not in queue`);
@@ -58,23 +67,27 @@ export class QueueEngineController {
 
   @Get('list')
   async list(
+    @Req() req: AuthedRequest,
     @Query('doctorId') doctorId: string,
     @Query('sessionDate') sessionDate: string,
     @Query('sessionType') sessionType: string,
   ) {
     const session = this.queryToSession(doctorId, sessionDate, sessionType);
+    await this.tenant.assertQueueAccess(req.user, doctorId);
     return this.queueService.listWithScores(session);
   }
 
   // ── live ETA (computed, never stored) ────────────────────
   @Get('eta')
   async eta(
+    @Req() req: AuthedRequest,
     @Query('doctorId') doctorId: string,
     @Query('sessionDate') sessionDate: string,
     @Query('sessionType') sessionType: string,
     @Query('token') token: string,
   ) {
     const session = this.queryToSession(doctorId, sessionDate, sessionType);
+    await this.tenant.assertQueueAccess(req.user, doctorId);
     if (!token) throw new BadRequestException('token is required');
     const eta = await this.etaService.etaFor(token, session);
     if (!eta) throw new NotFoundException(`token ${token} not in queue`);
@@ -83,11 +96,13 @@ export class QueueEngineController {
 
   @Get('eta-list')
   async etaList(
+    @Req() req: AuthedRequest,
     @Query('doctorId') doctorId: string,
     @Query('sessionDate') sessionDate: string,
     @Query('sessionType') sessionType: string,
   ) {
     const session = this.queryToSession(doctorId, sessionDate, sessionType);
+    await this.tenant.assertQueueAccess(req.user, doctorId);
     return this.etaService.etaForQueue(session);
   }
 
@@ -98,6 +113,7 @@ export class QueueEngineController {
     @Body() body: IssueTokenDto & { expectedToken?: string },
   ) {
     this.validate(body);
+    await this.tenant.assertQueueAccess(req.user, body.doctorId);
     const result = await this.consultationService.markDone(body, body.expectedToken ?? '');
     await this.log(req, 'DONE', body, {
       token: body.expectedToken,
@@ -110,6 +126,7 @@ export class QueueEngineController {
   @Post('no-show')
   async noShow(@Req() req: AuthedRequest, @Body() body: IssueTokenDto & { token?: string }) {
     this.validate(body);
+    await this.tenant.assertQueueAccess(req.user, body.doctorId);
     if (!body.token) throw new BadRequestException('token is required');
     const result = await this.consultationService.markNoShow(body, body.token);
     await this.log(req, 'NO_SHOW', body, { token: body.token });
@@ -120,6 +137,7 @@ export class QueueEngineController {
   @Post('skip')
   async skip(@Req() req: AuthedRequest, @Body() body: IssueTokenDto & { token?: string }) {
     this.validate(body);
+    await this.tenant.assertQueueAccess(req.user, body.doctorId);
     if (!body.token) throw new BadRequestException('token is required');
     const result = await this.consultationService.skip(body, body.token);
     await this.log(req, 'SKIP', body, { token: body.token });
@@ -133,7 +151,10 @@ export class QueueEngineController {
     @Body() body: IssueTokenDto & { source?: string; bookingId?: string },
   ) {
     this.validate(body);
+    await this.tenant.assertQueueAccess(req.user, body.doctorId);
     if (!body.bookingId) throw new BadRequestException('bookingId is required');
+    // the booking itself must also be inside the caller's scope
+    await this.tenant.assertBookingAccess(req.user, body.bookingId);
     const source = this.parseSource(body.source);
     const result = await this.consultationService.priorityInsert(source, body, body.bookingId);
     await this.log(req, 'PRIORITY', body, {
@@ -155,11 +176,13 @@ export class QueueEngineController {
     },
   ) {
     this.validate(body);
+    await this.tenant.assertQueueAccess(req.user, body.doctorId);
     if (!body.token || !body.afterToken || !body.bookingId) {
       throw new BadRequestException(
         'token, afterToken and bookingId are required',
       );
     }
+    await this.tenant.assertBookingAccess(req.user, body.bookingId);
     const result = await this.consultationService.reinsert(
       body,
       body.token,

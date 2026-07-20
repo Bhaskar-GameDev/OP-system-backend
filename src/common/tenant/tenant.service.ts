@@ -4,6 +4,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { SessionClaims } from '../../auth/auth-token.service';
 
 /**
  * Shared tenant-isolation enforcement. The single place staff-side queries go to
@@ -66,6 +67,80 @@ export class TenantService {
       select: { clinic: { select: { hospitalId: true } } },
     });
     return !!doctor && doctor.clinic.hospitalId === hospitalId;
+  }
+
+  /**
+   * Authorize a queue/session action on `doctorId` for the calling principal.
+   * The doctorId always arrives from the REQUEST, so it must never be trusted —
+   * this is the single gate for every `/queue/*` operation:
+   *   DOCTOR -> may only act on their OWN queue (token doctorId must match)
+   *   STAFF  -> doctor must be in the staff member's clinic
+   *   ADMIN  -> doctor must be in the admin's hospital (any clinic under it)
+   * A doctor outside the caller's scope is not-found/forbidden, never actionable.
+   */
+  async assertQueueAccess(
+    claims: SessionClaims | undefined,
+    doctorId: string,
+  ): Promise<void> {
+    if (!claims) throw new ForbiddenException('missing identity');
+
+    if (claims.role === 'DOCTOR') {
+      const own = claims.doctorId ?? claims.sub;
+      if (own !== doctorId) {
+        throw new ForbiddenException('you may only act on your own queue');
+      }
+      return;
+    }
+
+    if (claims.role === 'STAFF') {
+      if (!claims.clinicId) throw new ForbiddenException('token missing clinic scope');
+      const doctor = await this.prisma.doctor.findUnique({
+        where: { id: doctorId },
+        select: { clinicId: true },
+      });
+      if (!doctor) throw new NotFoundException('doctor not found');
+      if (doctor.clinicId !== claims.clinicId) {
+        throw new ForbiddenException('doctor belongs to another clinic');
+      }
+      return;
+    }
+
+    if (claims.role === 'ADMIN') {
+      await this.assertDoctorInHospital(
+        TenantService.hospitalIdOrThrow(claims.hospitalId),
+        doctorId,
+      );
+      return;
+    }
+
+    throw new ForbiddenException('insufficient role for queue operations');
+  }
+
+  /**
+   * Authorize an action targeting a specific booking id (also request-supplied).
+   * PATIENT -> must own it; DOCTOR -> must be their booking; STAFF/ADMIN -> the
+   * booking's clinic must fall inside their clinic/hospital scope.
+   */
+  async assertBookingAccess(
+    claims: SessionClaims | undefined,
+    bookingId: string,
+  ): Promise<void> {
+    if (!claims) throw new ForbiddenException('missing identity');
+
+    const booking = await this.prisma.booking.findUnique({
+      where: { id: bookingId },
+      select: { patientId: true, doctorId: true },
+    });
+    if (!booking) throw new NotFoundException('booking not found');
+
+    if (claims.role === 'PATIENT') {
+      if (booking.patientId !== claims.sub) {
+        throw new NotFoundException('booking not found'); // no existence leak
+      }
+      return;
+    }
+    // DOCTOR / STAFF / ADMIN all reduce to "is this booking's doctor in my scope".
+    await this.assertQueueAccess(claims, booking.doctorId);
   }
 
   /** The tenant boundary from a token — throws if a staff/doctor token predates
