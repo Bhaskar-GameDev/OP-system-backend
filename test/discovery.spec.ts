@@ -1,14 +1,29 @@
 import { AddressInfo } from 'node:net';
 import { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
+import { BookingSource, BookingStatus } from '@prisma/client';
 import { AppModule } from '../src/app.module';
 import { PrismaService } from '../src/common/prisma/prisma.service';
 import { toPublicDoctor } from '../src/discovery/discovery.dto';
+
+/** Local-calendar YYYY-MM-DD — mirrors the service (never UTC). */
+function ymdLocal(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
 
 describe('Discovery — public, no auth, no auth-field leakage (real Postgres)', () => {
   let app: INestApplication;
   let prisma: PrismaService;
   let url: string;
+  const PATIENT_ID = 'disc-pt-1';
+
+  // Sessions on EVERY weekday so the next-7-days window always has entries
+  // regardless of what day the test runs.
+  const MORNING_MAX = 5;
+  const EVENING_MAX = 3;
 
   const CLINIC_ID = 'disc-clinic';
   const DOCTOR_ID = 'disc-doctor';
@@ -42,9 +57,29 @@ describe('Discovery — public, no auth, no auth-field leakage (real Postgres)',
       },
       update: { username: SECRET_USERNAME, passwordHash: SECRET_HASH },
     });
+
+    // Clean any stale bookings from a prior run (capacity is DB-derived now).
+    await prisma.booking.deleteMany({ where: { doctorId: DOCTOR_ID } });
+    await prisma.patient.upsert({
+      where: { id: PATIENT_ID },
+      create: { id: PATIENT_ID, name: 'Disc Patient', mobile: `7${Date.now()}` },
+      update: {},
+    });
+
+    // Recurring weekly sessions on all 7 days (idempotent: clear then create).
+    await prisma.doctorSession.deleteMany({ where: { doctorId: DOCTOR_ID } });
+    await prisma.doctorSession.createMany({
+      data: [
+        { doctorId: DOCTOR_ID, sessionType: 'MORNING', startTime: '09:00', maxTokens: MORNING_MAX, daysOfWeek: [0, 1, 2, 3, 4, 5, 6] },
+        { doctorId: DOCTOR_ID, sessionType: 'EVENING', startTime: '17:00', maxTokens: EVENING_MAX, daysOfWeek: [0, 1, 2, 3, 4, 5, 6] },
+      ],
+    });
   });
 
   afterAll(async () => {
+    await prisma.booking.deleteMany({ where: { doctorId: DOCTOR_ID } });
+    await prisma.patient.deleteMany({ where: { id: PATIENT_ID } });
+    await prisma.doctorSession.deleteMany({ where: { doctorId: DOCTOR_ID } });
     await prisma.doctor.deleteMany({ where: { id: DOCTOR_ID } });
     await prisma.clinic.deleteMany({ where: { id: CLINIC_ID } });
     await app.close();
@@ -107,5 +142,69 @@ describe('Discovery — public, no auth, no auth-field leakage (real Postgres)',
     expect(serialized).not.toContain('username');
     // and the projection is a fresh object — not the same reference
     expect(projected).not.toBe(rawDoctor);
+  });
+
+  it('schedule endpoint returns weekly templates + next-7-days availability, no auth leakage', async () => {
+    const res = await fetch(`${url}/doctors/${DOCTOR_ID}/schedule`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    expect(body.doctorId).toBe(DOCTOR_ID);
+    expect(body.consultationFee).toBe(700);
+    expect(body.photoUrl).toBeNull();
+    expect(body.clinic.name).toBe('Discovery Clinic');
+
+    // weekly: both standing templates, each carrying its capacity + days
+    expect(body.weekly).toHaveLength(2);
+    const morning = body.weekly.find((w: { sessionType: string }) => w.sessionType === 'MORNING');
+    expect(morning.startTime).toBe('09:00');
+    expect(morning.maxTokens).toBe(MORNING_MAX);
+    expect(morning.daysOfWeek).toEqual([0, 1, 2, 3, 4, 5, 6]);
+
+    // upcoming: 7 days × 2 sessions/day, all empty so all available
+    expect(body.upcoming).toHaveLength(14);
+    expect(body.upcoming.every((u: { available: boolean }) => u.available)).toBe(true);
+    expect(body.upcoming.every((u: { tokensIssued: number }) => u.tokensIssued === 0)).toBe(true);
+    // sorted by date then start time
+    const keys = body.upcoming.map((u: { date: string; startTime: string }) => `${u.date} ${u.startTime}`);
+    expect(keys).toEqual([...keys].sort());
+
+    expect(JSON.stringify(body)).not.toContain(SECRET_HASH);
+    expect(JSON.stringify(body)).not.toContain(SECRET_USERNAME);
+  });
+
+  it('a session at maxTokens is reported unavailable', async () => {
+    const today = ymdLocal(new Date());
+    // Fill today's MORNING session to capacity with live bookings (capacity is
+    // the count of non-cancelled bookings — so this is what a real fill looks
+    // like, and a cancel would reopen a slot).
+    await prisma.booking.createMany({
+      data: Array.from({ length: MORNING_MAX }, () => ({
+        patientId: PATIENT_ID,
+        doctorId: DOCTOR_ID,
+        source: BookingSource.APP,
+        sessionDate: new Date(today),
+        sessionType: 'MORNING' as const,
+        status: BookingStatus.BOOKED,
+      })),
+    });
+
+    const body = await (await fetch(`${url}/doctors/${DOCTOR_ID}/schedule`)).json();
+    const todayMorning = body.upcoming.find(
+      (u: { date: string; sessionType: string }) => u.date === today && u.sessionType === 'MORNING',
+    );
+    expect(todayMorning.tokensIssued).toBe(MORNING_MAX);
+    expect(todayMorning.available).toBe(false);
+
+    // a different session that day is untouched and still bookable
+    const todayEvening = body.upcoming.find(
+      (u: { date: string; sessionType: string }) => u.date === today && u.sessionType === 'EVENING',
+    );
+    expect(todayEvening.available).toBe(true);
+  });
+
+  it('schedule for an unknown doctor is 404', async () => {
+    const res = await fetch(`${url}/doctors/does-not-exist/schedule`);
+    expect(res.status).toBe(404);
   });
 });

@@ -36,6 +36,21 @@ export class DiscoveryController {
   getDoctor(@Param('id') id: string) {
     return this.discovery.getDoctor(id);
   }
+
+  /** Public weekly schedule + next-7-days availability (tokens issued vs max). */
+  @Get('doctors/:id/schedule')
+  getDoctorSchedule(@Param('id') id: string) {
+    return this.discovery.getDoctorSchedule(id);
+  }
+
+  /**
+   * Same-day model: the session the patient would join right now (time window +
+   * fee), or whether none remains today. Powers the "Join Queue" screen.
+   */
+  @Get('doctors/:id/today')
+  getTodaySession(@Param('id') id: string) {
+    return this.discovery.getTodaySession(id);
+  }
 }
 
 function toInt(v?: string): number | undefined {

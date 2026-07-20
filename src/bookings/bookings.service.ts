@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { BookingStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
 import {
+  DoctorInfo,
   Page,
   PublicBooking,
   toPublicFromHistory,
@@ -48,15 +49,25 @@ export class BookingsService {
     return { skip: (p - 1) * size, take: size, page: p, pageSize: size };
   }
 
-  /** doctorId -> name, batched so the listing never N+1s. */
-  private async doctorNames(ids: string[]): Promise<Map<string, string>> {
+  /** doctorId -> {name, fee, clinic}, batched so the listing never N+1s. */
+  private async doctorInfo(ids: string[]): Promise<Map<string, DoctorInfo>> {
     const unique = [...new Set(ids)];
     if (unique.length === 0) return new Map();
     const docs = await this.prisma.doctor.findMany({
       where: { id: { in: unique } },
-      select: { id: true, name: true },
+      select: {
+        id: true,
+        name: true,
+        consultationFee: true,
+        clinic: { select: { id: true, name: true } },
+      },
     });
-    return new Map(docs.map((d) => [d.id, d.name]));
+    return new Map(
+      docs.map((d) => [
+        d.id,
+        { name: d.name, fee: d.consultationFee, clinicId: d.clinic.id, clinicName: d.clinic.name },
+      ]),
+    );
   }
 
   /** Upcoming = not-yet-settled live bookings (pending/booked/active). */
@@ -74,13 +85,32 @@ export class BookingsService {
       }),
       this.prisma.booking.count({ where }),
     ]);
-    const names = await this.doctorNames(rows.map((r) => r.doctorId));
-    return {
-      items: rows.map((r) => toPublicFromLive(r, names.get(r.doctorId) ?? null)),
-      page: p,
-      pageSize: size,
-      total,
-    };
+    const info = await this.doctorInfo(rows.map((r) => r.doctorId));
+    const items = rows.map((r) => toPublicFromLive(r, info.get(r.doctorId) ?? null));
+    this.markEligibility(rows, items);
+    return { items, page: p, pageSize: size, total };
+  }
+
+  /**
+   * Stamp cancellable on the live upcoming items. Eligible = status BOOKED
+   * (still waiting in the queue, not yet called). No time gate: the old
+   * cancellation cutoff was removed with same-day booking — a patient joining
+   * close to session start could otherwise never self-cancel.
+   *
+   * `reschedulable` is always left false — reschedule was deprecated with the
+   * move to same-day-only booking (the field stays on the DTO for wire-shape
+   * stability but no longer toggles).
+   */
+  private markEligibility(
+    rows: { id: string; status: BookingStatus }[],
+    items: PublicBooking[],
+  ): void {
+    const cancellableIds = new Set(
+      rows.filter((r) => r.status === BookingStatus.BOOKED).map((r) => r.id),
+    );
+    for (const item of items) {
+      if (cancellableIds.has(item.id)) item.cancellable = true;
+    }
   }
 
   /**
@@ -103,14 +133,14 @@ export class BookingsService {
       }),
     ]);
 
-    const names = await this.doctorNames([
+    const info = await this.doctorInfo([
       ...liveTerminal.map((b) => b.doctorId),
       ...history.map((h) => h.doctorId),
     ]);
 
     const merged: PublicBooking[] = [
-      ...liveTerminal.map((b) => toPublicFromLive(b, names.get(b.doctorId) ?? null)),
-      ...history.map((h) => toPublicFromHistory(h, names.get(h.doctorId) ?? null)),
+      ...liveTerminal.map((b) => toPublicFromLive(b, info.get(b.doctorId) ?? null)),
+      ...history.map((h) => toPublicFromHistory(h, info.get(h.doctorId) ?? null)),
     ];
     // most recent first: by session date, then by creation time
     merged.sort((a, b) =>

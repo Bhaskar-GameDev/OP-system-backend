@@ -64,6 +64,14 @@ class FakeRazorpay implements RazorpayGateway {
 }
 const checkoutSig = (o: string, p: string): string =>
   createHmac('sha256', KEY_SECRET).update(`${o}|${p}`).digest('hex');
+/** Today as local YYYY-MM-DD (same-day booking resolves onto today). */
+function e2eTodayYmd(): string {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
 
 class CapturingSms implements SmsSender {
   last?: { mobile: string; otp: string };
@@ -103,7 +111,9 @@ describe('Integration — full real chain (Redis + Postgres + WS)', () => {
 
   const CLINIC_ID = 'e2e-clinic';
   const DOCTOR_ID = 'e2e-doctor';
-  const session: SessionKey = { doctorId: DOCTOR_ID, sessionDate: '2026-06-19', sessionType: 'MORNING' };
+  // Same-day model: APP bookings resolve onto today's session, so the queue key
+  // and the directly-seeded bookings must all sit on today.
+  const session: SessionKey = { doctorId: DOCTOR_ID, sessionDate: e2eTodayYmd(), sessionType: 'MORNING' };
 
   const MOBILE_A = '9100000001';
   let patientA = '';
@@ -150,6 +160,14 @@ describe('Integration — full real chain (Redis + Postgres + WS)', () => {
       },
       update: { username: 'dr.e2e', passwordHash: await passwords.hash('docpass'), consultationFee: 600 },
     });
+    // Same-day session every weekday so initiateBooking resolves today's MORNING.
+    await prisma.doctorSession.deleteMany({ where: { doctorId: DOCTOR_ID } });
+    await prisma.doctorSession.create({
+      data: {
+        doctorId: DOCTOR_ID, sessionType: 'MORNING', startTime: '09:00',
+        maxTokens: 100, daysOfWeek: [0, 1, 2, 3, 4, 5, 6],
+      },
+    });
 
     // patient A via REAL OTP login + registered device
     await auth.requestPatientOtp(MOBILE_A);
@@ -191,7 +209,7 @@ describe('Integration — full real chain (Redis + Postgres + WS)', () => {
   /** initiate + pay an APP booking for a patient -> returns issued token. */
   async function payApp(patientId: string): Promise<string> {
     const { bookingId, orderId, amount } = await payments.initiateBooking({
-      patientId, doctorId: DOCTOR_ID, sessionDate: session.sessionDate, sessionType: 'MORNING', source: BookingSource.APP,
+      patientId, doctorId: DOCTOR_ID, source: BookingSource.APP,
     });
     const paymentId = `pay_${orderId}`;
     rp.capture(orderId, paymentId, amount);

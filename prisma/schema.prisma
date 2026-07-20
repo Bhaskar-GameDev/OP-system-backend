@@ -46,6 +46,7 @@ enum BookingStatus {
   COMPLETED // doctor pressed DONE
   NO_SHOW // did not arrive
   CANCELLED // cancelled (may carry refund)
+  EXPIRED // payment failed or never completed (webhook payment.failed / timeout sweep) — never got a token
 }
 
 enum PaymentStatus {
@@ -56,6 +57,21 @@ enum PaymentStatus {
 }
 
 // ─── Models ───────────────────────────────────────────────
+
+// Top-level tenant. A Hospital owns one or more Clinics and the Staff accounts
+// that administer them. Tenant isolation is enforced by hospitalId: staff never
+// see data outside their own hospital. Patients are intentionally cross-hospital
+// (they search/book anywhere) and carry no hospitalId.
+model Hospital {
+  id        String   @id @default(uuid())
+  name      String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  clinics Clinic[]
+  staff   Staff[]
+
+  @@map("hospitals")
+}
 
 model Patient {
   id        String   @id @default(uuid())
@@ -75,14 +91,62 @@ model Patient {
 
 model Clinic {
   id            String @id @default(uuid())
+  // tenant owner — required. DB default is the migration's backfill hospital so
+  // pre-tenant callers/tests never strand a row; real creates set it explicitly.
+  hospitalId    String @default("00000000-0000-0000-0000-0000000000a1") @map("hospital_id")
   name          String
   address       String?
   contactNumber String? @map("contact_number")
 
-  doctors Doctor[]
-  staff   Staff[]
+  // DEPRECATED (unused): was the cancel/reschedule cutoff — no cancel within N
+  // minutes of session start. Removed with same-day booking (it created a dead
+  // end: a patient joining near session start could never self-cancel). Cancel
+  // eligibility is now the status gate alone. Column retained to avoid a
+  // migration; no code reads it. No admin UI ever exposed it.
+  cancellationCutoffMinutes Int @default(30) @map("cancellation_cutoff_minutes")
 
+  hospital     Hospital      @relation(fields: [hospitalId], references: [id])
+  doctors      Doctor[]
+  staff        Staff[]
+  voiceNumbers VoiceNumber[]
+
+  @@index([hospitalId])
   @@map("clinics")
+}
+
+// Maps an inbound telephony DID (the number a patient dialed) to the clinic that
+// owns it — the voice agent passes the DID, the backend resolves the clinic (and
+// thus the tenant). One clinic may own several lines; a line belongs to one clinic.
+model VoiceNumber {
+  id        String   @id @default(uuid())
+  didNumber String   @unique @map("did_number")
+  clinicId  String   @map("clinic_id")
+  language  String? // default IVR language hint: en | te | hi
+  createdAt DateTime @default(now()) @map("created_at")
+
+  clinic Clinic @relation(fields: [clinicId], references: [id])
+
+  @@index([clinicId])
+  @@map("voice_numbers")
+}
+
+// Append-only record of a voice call (transcript, extracted slots, outcome). The
+// agent posts this at end-of-call; idempotent by callSid. Never drives booking.
+model VoiceCallLog {
+  id              String   @id @default(uuid())
+  callSid         String   @unique @map("call_sid")
+  didNumber       String?  @map("did_number")
+  callerPhone     String?  @map("caller_phone")
+  clinicId        String?  @map("clinic_id")
+  language        String?
+  transcript      Json?
+  slots           Json?
+  bookingId       String?  @map("booking_id")
+  outcome         String?
+  durationSeconds Int?     @map("duration_seconds")
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  @@map("voice_call_logs")
 }
 
 model Doctor {
@@ -92,29 +156,83 @@ model Doctor {
   specialization   String?
   consultationFee  Int    @default(0) @map("consultation_fee")
   avgConsultMinutes Int   @default(10) @map("avg_consult_minutes")
+  // Public profile photo (URL). Optional — discovery/app fall back to initials.
+  photoUrl         String? @map("photo_url")
 
   // login (username/password) — bcrypt hash, never plaintext
   username     String? @unique
   passwordHash String? @map("password_hash")
 
-  clinic        Clinic         @relation(fields: [clinicId], references: [id])
+  clinic        Clinic          @relation(fields: [clinicId], references: [id])
   bookings      Booking[]
   queueSessions QueueSession[]
+  sessions      DoctorSession[]
+  consultationNotes ConsultationNote[]
 
   @@index([clinicId])
   @@map("doctors")
 }
 
+// One consultation record per booking — the doctor's note captured at (or after)
+// COMPLETE. All clinical fields except `notes` are optional so a doctor is never
+// blocked from completing; `notes` defaults to "" for the same reason. Unique on
+// bookingId: saving again from the doctor app upserts this row (view/edit).
+//
+// `bookingId` is a LOGICAL link (not a Booking FK) deliberately: the archival
+// sweep DELETES settled bookings into booking_history, and a clinical note must
+// outlive that move so a patient can still read it for an archived past visit.
+model ConsultationNote {
+  id            String    @id @default(uuid())
+  bookingId     String    @unique @map("booking_id")
+  doctorId      String    @map("doctor_id")
+  notes         String    @default("")
+  diagnosis     String?
+  prescriptions String?
+  followUpDate  DateTime? @map("follow_up_date") @db.Date
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  doctor Doctor @relation(fields: [doctorId], references: [id])
+
+  @@index([doctorId])
+  @@map("consultation_notes")
+}
+
+// Recurring weekly session schedule (template) — distinct from QueueSession,
+// which is a single date's live queue. Admin-managed: when a doctor consults
+// (morning/evening), from what start time, how many tokens, on which weekdays.
+// A doctor may not have two schedules of the SAME session type sharing a weekday
+// (enforced in the admin service — overlap = same day + same session type).
+model DoctorSession {
+  id          String      @id @default(uuid())
+  doctorId    String      @map("doctor_id")
+  sessionType SessionType @map("session_type")
+  startTime   String      @map("start_time") // "HH:MM" 24h local clinic time
+  maxTokens   Int         @map("max_tokens")
+  daysOfWeek  Int[]       @map("days_of_week") // 0=Sunday … 6=Saturday
+  createdAt   DateTime    @default(now()) @map("created_at")
+  updatedAt   DateTime    @updatedAt @map("updated_at")
+
+  doctor Doctor @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+
+  @@index([doctorId])
+  @@map("doctor_sessions")
+}
+
 model Staff {
   id               String    @id @default(uuid())
+  // tenant owner — required; DB default = backfill hospital (see Clinic.hospitalId)
+  hospitalId       String    @default("00000000-0000-0000-0000-0000000000a1") @map("hospital_id")
   clinicId         String    @map("clinic_id")
   name             String
   role             StaffRole
   username         String?   @unique
   loginCredentials String    @map("login_credentials") // bcrypt password hash — never plaintext
 
-  clinic Clinic @relation(fields: [clinicId], references: [id])
+  hospital Hospital @relation(fields: [hospitalId], references: [id])
+  clinic   Clinic   @relation(fields: [clinicId], references: [id])
 
+  @@index([hospitalId])
   @@index([clinicId])
   @@map("staff")
 }
@@ -131,6 +249,13 @@ model Booking {
   paymentId   String?       @unique @map("payment_id")
   createdAt   DateTime      @default(now()) @map("created_at")
 
+  // Patient-initiated cancellation / rescheduling.
+  cancellationReason    String? @map("cancellation_reason") // optional free-text from the patient
+  refundStatus          String? @map("refund_status") // razorpay refund state: pending | processed | failed
+  // When this booking was created by rescheduling another, points at the old
+  // (now CANCELLED) booking — links the two legs for a clean audit trail.
+  rescheduleOfBookingId String? @map("reschedule_of_booking_id")
+
   // Consultation timestamps — captured live by the queue-advance flow.
   // (Required by spec "Consultation Timestamps"; no later point can recover them.)
   consultationStartedAt DateTime? @map("consultation_started_at") // set when promoted to ACTIVE (rank 0)
@@ -139,6 +264,15 @@ model Booking {
   // Physical arrival at the clinic — purely informational, SEPARATE from queue
   // position / no-show. arrived = checkedInAt != null. Never drives Redis.
   checkedInAt           DateTime? @map("checked_in_at")
+
+  // Voice "pay-at-desk" hybrid: a phone booking issues a real token now but is
+  // settled in cash/UPI at reception on arrival (no online payment on a call).
+  // payAtDesk=true + an attached Payment at status CREATED = "token held, unpaid".
+  // Reception's collect-payment flips the Payment to SUCCESS.
+  payAtDesk             Boolean   @default(false) @map("pay_at_desk")
+  // Idempotency key for voice bookings — a dropped+retried call (same callSid)
+  // returns the existing booking instead of issuing a second token.
+  voiceCallSid          String?   @unique @map("voice_call_sid")
 
   patient Patient  @relation(fields: [patientId], references: [id])
   doctor  Doctor   @relation(fields: [doctorId], references: [id])
@@ -213,6 +347,28 @@ model BookingHistory {
   @@index([clinicId, sessionDate])
   @@index([patientId])
   @@map("booking_history")
+}
+
+// Append-only audit of staff/doctor queue-control actions (DONE / NO_SHOW /
+// SKIP / PRIORITY / REINSERT). Compliance trail: WHO did WHAT to which token,
+// in which session. Written after the action succeeds; never updated/deleted.
+model AuditLog {
+  id          String      @id @default(uuid())
+  actorId     String      @map("actor_id") // JWT sub — staff or doctor id
+  actorRole   String      @map("actor_role") // DOCTOR | STAFF | ADMIN
+  clinicId    String?     @map("clinic_id") // JWT clinic scope (doctors may lack one)
+  action      String // DONE | NO_SHOW | SKIP | PRIORITY | REINSERT
+  doctorId    String      @map("doctor_id")
+  sessionDate DateTime    @map("session_date") @db.Date
+  sessionType SessionType @map("session_type")
+  token       String? // target token, where the action targets one
+  bookingId   String?     @map("booking_id") // target booking (priority/reinsert)
+  metadata    Json? // extra context: afterToken, expectedToken, source, …
+  createdAt   DateTime    @default(now()) @map("created_at")
+
+  @@index([clinicId, createdAt])
+  @@index([doctorId, sessionDate])
+  @@map("audit_logs")
 }
 
 model AnalyticsDaily {

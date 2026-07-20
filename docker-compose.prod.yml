@@ -1,0 +1,138 @@
+# Patient Flow OS — PRODUCTION stack for a single VPS.
+#
+# Separate from docker-compose.yml (local demo) — never overrides it.
+# Run with an explicit env file so values are read from .env.production:
+#
+#   docker compose -f docker-compose.prod.yml --env-file .env.production up -d --build
+#
+# Hardening vs local compose:
+#   - Postgres + Redis have NO host ports (internal network only).
+#   - Only Caddy is published (80/443); the backend is reachable only via Caddy.
+#   - Caddy terminates HTTPS with automatic Let's Encrypt certs ({$DOMAIN}).
+#   - restart: always on every service; backend waits for healthy deps.
+#   - Redis requires a password; Postgres password comes from the env file.
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: pfos_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: pfos
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.production}
+      POSTGRES_DB: patient_flow_os
+    volumes:
+      - pfos_pgdata:/var/lib/postgresql/data
+    networks:
+      - internal
+    # No `ports:` — Postgres is unreachable from the host/internet.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pfos -d patient_flow_os"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    container_name: pfos_redis
+    restart: always
+    environment:
+      # Exposed to the container so the healthcheck shell can authenticate.
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env.production}
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD in .env.production}"]
+    volumes:
+      - pfos_redisdata:/data
+    networks:
+      - internal
+    # No `ports:` — Redis is unreachable from the host/internet.
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  backend:
+    build: .
+    container_name: pfos_backend
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgresql://pfos:${POSTGRES_PASSWORD}@postgres:5432/patient_flow_os?schema=public
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env.production}
+      OTP_EXPIRY_SECONDS: ${OTP_EXPIRY_SECONDS:-300}
+      # Public origin(s). The desktop apps use tauri.localhost; the patient
+      # native app sends no Origin. Add hosted web origins here if any.
+      CORS_ORIGINS: "https://${DOMAIN},http://tauri.localhost,https://tauri.localhost"
+      # Seed demo data on first start (idempotent). Set SEED_ON_START=false in
+      # .env.production once you have real data you don't want demo rows beside.
+      SEED_ON_START: ${SEED_ON_START:-true}
+      # External integrations (blank -> dev fallbacks). Provided by .env.production.
+      MSG91_AUTH_KEY: ${MSG91_AUTH_KEY:-}
+      MSG91_SENDER_ID: ${MSG91_SENDER_ID:-}
+      MSG91_OTP_TEMPLATE_ID: ${MSG91_OTP_TEMPLATE_ID:-}
+      INTEGRATIONS_TEST_MOBILE: ${INTEGRATIONS_TEST_MOBILE:-}
+      RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-}
+      RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:-}
+      RAZORPAY_WEBHOOK_SECRET: ${RAZORPAY_WEBHOOK_SECRET:-}
+      # Mount a service-account JSON at ./secrets and point here, or inline JSON.
+      FCM_SERVICE_ACCOUNT_PATH: ${FCM_SERVICE_ACCOUNT_PATH:-}
+      FCM_SERVICE_ACCOUNT_JSON: ${FCM_SERVICE_ACCOUNT_JSON:-}
+      NOTIFY_APPROACHING_AHEAD: ${NOTIFY_APPROACHING_AHEAD:-3}
+      NOTIFY_ARRIVAL_AHEAD: ${NOTIFY_ARRIVAL_AHEAD:-1}
+    volumes:
+      # Optional: FCM service-account secret, read-only. Safe if the dir is empty.
+      - ./secrets:/app/secrets:ro
+    networks:
+      - internal
+    # Reachable only inside the compose network (Caddy proxies to it).
+    expose:
+      - "3000"
+    healthcheck:
+      # Any HTTP response (even 401/404) means Nest is up and serving.
+      test:
+        - "CMD"
+        - "node"
+        - "-e"
+        - "require('http').get('http://127.0.0.1:3000',r=>process.exit(0)).on('error',()=>process.exit(1))"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: pfos_caddy
+    restart: always
+    depends_on:
+      - backend
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env.production}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - pfos_caddy_data:/data   # Let's Encrypt certs + ACME account (persist!)
+      - pfos_caddy_config:/config
+    networks:
+      - internal
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  pfos_pgdata:
+  pfos_redisdata:
+  pfos_caddy_data:
+  pfos_caddy_config:

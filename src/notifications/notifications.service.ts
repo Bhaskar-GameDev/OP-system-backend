@@ -17,7 +17,20 @@ export enum NotificationType {
   BOOKING_CONFIRMED = 'BOOKING_CONFIRMED',
   QUEUE_APPROACHING = 'QUEUE_APPROACHING',
   ARRIVAL_REMINDER = 'ARRIVAL_REMINDER',
+  PAYMENT_FAILED = 'PAYMENT_FAILED',
+  BOOKING_CANCELLED = 'BOOKING_CANCELLED',
 }
+
+/**
+ * firebase-admin error codes that mean the stored device token is dead. When we
+ * hit one we clear the patient's token so a later send doesn't keep failing and
+ * the app re-registers a fresh one on next open.
+ */
+const STALE_TOKEN_CODES = new Set([
+  'messaging/registration-token-not-registered',
+  'messaging/invalid-registration-token',
+  'messaging/invalid-argument',
+]);
 
 /**
  * Patient push notifications. A SECOND, independent consumer of the Queue
@@ -95,6 +108,7 @@ export class NotificationsService implements OnModuleInit, OnModuleDestroy {
       session,
       bookingId, // member: booking id (token is enough too, but confirm is per-booking)
       booking.patient?.fcmToken ?? null,
+      booking.patientId,
       booking.tokenNumber,
       {
         title: 'Booking confirmed',
@@ -103,6 +117,91 @@ export class NotificationsService implements OnModuleInit, OnModuleDestroy {
           type: NotificationType.BOOKING_CONFIRMED,
           bookingId,
           token: booking.tokenNumber,
+          doctorId: session.doctorId,
+          sessionDate: session.sessionDate,
+          sessionType: session.sessionType,
+        },
+      },
+    );
+  }
+
+  /**
+   * Payment Failed — fires once when a booking is expired (failed payment or the
+   * pending-payment timeout sweep). Tells the patient they can rebook. The
+   * booking has no token; the session is only used to key the idempotency set.
+   * Best-effort: deliverOnce swallows send errors so this never breaks the
+   * payments flow that called it.
+   */
+  async paymentFailed(bookingId: string): Promise<void> {
+    const booking = await this.prisma.booking.findUnique({
+      where: { id: bookingId },
+      include: { patient: { select: { fcmToken: true } } },
+    });
+    if (!booking) return;
+    const session: SessionKey = {
+      doctorId: booking.doctorId,
+      sessionDate: booking.sessionDate.toISOString().slice(0, 10),
+      sessionType: booking.sessionType,
+    };
+    await this.deliverOnce(
+      NotificationType.PAYMENT_FAILED,
+      session,
+      bookingId,
+      booking.patient?.fcmToken ?? null,
+      booking.patientId,
+      bookingId,
+      {
+        title: 'Payment failed',
+        body: 'Your payment did not go through, so your booking was not confirmed. You can try booking again.',
+        data: {
+          type: NotificationType.PAYMENT_FAILED,
+          bookingId,
+          doctorId: session.doctorId,
+          sessionDate: session.sessionDate,
+          sessionType: session.sessionType,
+        },
+      },
+    );
+  }
+
+  /**
+   * Booking Cancelled — fires once when a patient cancels their booking.
+   * Confirms the cancellation and, when a refund was triggered, its state
+   * (processed / pending / failed). Called directly from the cancel flow.
+   */
+  async bookingCancelled(bookingId: string, refundStatus: string | null): Promise<void> {
+    const booking = await this.prisma.booking.findUnique({
+      where: { id: bookingId },
+      include: { patient: { select: { fcmToken: true } } },
+    });
+    if (!booking) return;
+    const session: SessionKey = {
+      doctorId: booking.doctorId,
+      sessionDate: booking.sessionDate.toISOString().slice(0, 10),
+      sessionType: booking.sessionType,
+    };
+    const refundLine =
+      refundStatus === 'processed'
+        ? ' Your refund has been processed.'
+        : refundStatus === 'pending'
+          ? ' Your refund is being processed.'
+          : refundStatus === 'failed'
+            ? ' Your refund could not be processed — our team will follow up.'
+            : '';
+    await this.deliverOnce(
+      NotificationType.BOOKING_CANCELLED,
+      session,
+      bookingId,
+      booking.patient?.fcmToken ?? null,
+      booking.patientId,
+      booking.tokenNumber ?? bookingId,
+      {
+        title: 'Booking cancelled',
+        body: `Your booking has been cancelled.${refundLine}`,
+        data: {
+          type: NotificationType.BOOKING_CANCELLED,
+          bookingId,
+          refundStatus: refundStatus ?? '',
           doctorId: session.doctorId,
           sessionDate: session.sessionDate,
           sessionType: session.sessionType,
@@ -175,7 +274,7 @@ export class NotificationsService implements OnModuleInit, OnModuleDestroy {
             },
           };
 
-    await this.deliverOnce(type, session, token, fcm, token, message);
+    await this.deliverOnce(type, session, token, fcm, booking?.patientId ?? null, token, message);
   }
 
   /**
@@ -189,6 +288,7 @@ export class NotificationsService implements OnModuleInit, OnModuleDestroy {
     session: SessionKey,
     member: string,
     deviceToken: string | null,
+    patientId: string | null,
     logToken: string,
     message: PushMessage,
   ): Promise<void> {
@@ -203,7 +303,29 @@ export class NotificationsService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    await this.push.send(deviceToken, message);
+    // A push failure must NEVER propagate: bookingConfirmed is awaited inside
+    // the payments confirm handler (token already issued), and the threshold
+    // path runs off a committed queue mutation. A stale/invalid device token is
+    // self-healed by clearing it so future sends stop failing.
+    try {
+      await this.push.send(deviceToken, message);
+    } catch (err) {
+      const code = (err as { code?: string }).code ?? '';
+      this.logger.error(
+        `${type} push failed for ${logToken}: ${(err as Error).message}`,
+      );
+      if (STALE_TOKEN_CODES.has(code) && patientId) {
+        await this.prisma.patient
+          .updateMany({
+            where: { id: patientId, fcmToken: deviceToken },
+            data: { fcmToken: null },
+          })
+          .then(() =>
+            this.logger.warn(`cleared stale FCM token for patient ${patientId}`),
+          )
+          .catch(() => undefined);
+      }
+    }
   }
 
   /** Test/teardown helper: clear all idempotency flags for a session. */
@@ -212,6 +334,8 @@ export class NotificationsService implements OnModuleInit, OnModuleDestroy {
       this.flagKey(NotificationType.BOOKING_CONFIRMED, session),
       this.flagKey(NotificationType.QUEUE_APPROACHING, session),
       this.flagKey(NotificationType.ARRIVAL_REMINDER, session),
+      this.flagKey(NotificationType.PAYMENT_FAILED, session),
+      this.flagKey(NotificationType.BOOKING_CANCELLED, session),
     );
   }
 }

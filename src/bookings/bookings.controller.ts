@@ -2,6 +2,7 @@ import {
   BadRequestException,
   Controller,
   Get,
+  Param,
   Query,
   Req,
   UseGuards,
@@ -10,6 +11,7 @@ import { AuthedRequest, JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { RolesGuard } from '../auth/roles.guard';
 import { Roles } from '../auth/roles.decorator';
 import { BookingsService } from './bookings.service';
+import { ConsultationNotesService } from '../consultation-notes/consultation-notes.service';
 
 /**
  * A patient's own booking history. PATIENT-only; the patient id comes from the
@@ -19,7 +21,10 @@ import { BookingsService } from './bookings.service';
 @UseGuards(JwtAuthGuard, RolesGuard)
 @Roles('PATIENT')
 export class BookingsController {
-  constructor(private readonly bookings: BookingsService) {}
+  constructor(
+    private readonly bookings: BookingsService,
+    private readonly notes: ConsultationNotesService,
+  ) {}
 
   @Get('upcoming')
   upcoming(
@@ -37,6 +42,16 @@ export class BookingsController {
     @Query('pageSize') pageSize?: string,
   ) {
     return this.bookings.past(patientId(req), toInt(page), toInt(pageSize));
+  }
+
+  /**
+   * GET /me/bookings/:bookingId/note — the consultation note for one of the
+   * patient's own bookings, or null if the doctor recorded none. Patient-scoped:
+   * 404 if the booking isn't theirs.
+   */
+  @Get(':bookingId/note')
+  note(@Req() req: AuthedRequest, @Param('bookingId') bookingId: string) {
+    return this.notes.getForPatient(patientId(req), bookingId);
   }
 }
 

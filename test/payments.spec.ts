@@ -53,6 +53,14 @@ class FakeRazorpay implements RazorpayGateway {
 function checkoutSig(orderId: string, paymentId: string): string {
   return createHmac('sha256', KEY_SECRET).update(`${orderId}|${paymentId}`).digest('hex');
 }
+/** Today as local YYYY-MM-DD (same-day booking resolves onto today). */
+function todayYmd(): string {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
 function webhookBody(orderId: string, paymentId: string): { raw: string; sig: string } {
   const raw = JSON.stringify({
     event: 'payment.captured',
@@ -72,9 +80,11 @@ describe('PaymentsService — idempotent confirm + cancel (real Redis + Postgres
   const CLINIC_ID = 'pay-clinic';
   const DOCTOR_ID = 'pay-doctor';
   const FEE = 500; // rupees -> 50000 paise
+  // Same-day model: bookings resolve onto TODAY's session, so the queue key the
+  // assertions clear/inspect must be today + the seeded session type.
   const session: SessionKey = {
     doctorId: DOCTOR_ID,
-    sessionDate: '2026-06-19',
+    sessionDate: todayYmd(),
     sessionType: 'MORNING',
   };
   let paySeq = 0;
@@ -101,6 +111,17 @@ describe('PaymentsService — idempotent confirm + cancel (real Redis + Postgres
       create: { id: DOCTOR_ID, clinicId: CLINIC_ID, name: 'Dr Pay', consultationFee: FEE },
       update: { consultationFee: FEE },
     });
+    // A single MORNING session every weekday so resolveToday always resolves it.
+    await prisma.doctorSession.deleteMany({ where: { doctorId: DOCTOR_ID } });
+    await prisma.doctorSession.create({
+      data: {
+        doctorId: DOCTOR_ID,
+        sessionType: 'MORNING',
+        startTime: '09:00',
+        maxTokens: 50,
+        daysOfWeek: [0, 1, 2, 3, 4, 5, 6],
+      },
+    });
   });
 
   beforeEach(async () => {
@@ -109,6 +130,7 @@ describe('PaymentsService — idempotent confirm + cancel (real Redis + Postgres
 
   afterAll(async () => {
     await clean();
+    await prisma.doctorSession.deleteMany({ where: { doctorId: DOCTOR_ID } });
     await prisma.doctor.deleteMany({ where: { id: DOCTOR_ID } });
     await prisma.clinic.deleteMany({ where: { id: CLINIC_ID } });
     await app.close();
@@ -141,8 +163,6 @@ describe('PaymentsService — idempotent confirm + cancel (real Redis + Postgres
     const { bookingId, orderId, amount } = await payments.initiateBooking({
       patientId: pid,
       doctorId: DOCTOR_ID,
-      sessionDate: session.sessionDate,
-      sessionType: 'MORNING',
       source: BookingSource.APP,
     });
     const paymentId = `pay_${orderId}`;

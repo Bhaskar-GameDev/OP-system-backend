@@ -3,6 +3,7 @@ import { ConfigModule } from '@nestjs/config';
 import { ScheduleModule } from '@nestjs/schedule';
 import { RedisModule } from './common/redis/redis.module';
 import { PrismaModule } from './common/prisma/prisma.module';
+import { TenantModule } from './common/tenant/tenant.module';
 import { QueueEngineModule } from './queue-engine/queue-engine.module';
 import { AuthModule } from './auth/auth.module';
 import { BookingsModule } from './bookings/bookings.module';
@@ -12,12 +13,17 @@ import { ArchivalModule } from './archival/archival.module';
 import { DiscoveryModule } from './discovery/discovery.module';
 import { AdminModule } from './admin/admin.module';
 import { ReceptionModule } from './reception/reception.module';
+import { DoctorModule } from './doctor/doctor.module';
+import { ProfileModule } from './profile/profile.module';
+import { IntegrationsModule } from './integrations/integrations.module';
+import { VoiceModule } from './voice/voice.module';
 
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
     ScheduleModule.forRoot(),
     PrismaModule,
+    TenantModule,
     RedisModule,
     QueueEngineModule,
     AuthModule,
@@ -28,6 +34,10 @@ import { ReceptionModule } from './reception/reception.module';
     DiscoveryModule,
     AdminModule,
     ReceptionModule,
+    DoctorModule,
+    ProfileModule,
+    IntegrationsModule,
+    VoiceModule,
   ],
 })
 export class AppModule {}

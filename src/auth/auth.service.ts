@@ -11,6 +11,10 @@ export interface AuthResult {
   role: Role;
   sub: string;
   refreshToken?: string;
+  // Staff/doctor only — surfaced so the desktop apps can show the tenant in the
+  // header. Patients are cross-hospital and never carry one.
+  hospitalId?: string;
+  hospitalName?: string;
 }
 
 /**
@@ -77,7 +81,10 @@ export class AuthService {
 
   // ── staff login (username/password) ──────────────────────
   async staffLogin(username: string, password: string): Promise<AuthResult> {
-    const staff = await this.prisma.staff.findUnique({ where: { username } });
+    const staff = await this.prisma.staff.findUnique({
+      where: { username },
+      include: { hospital: { select: { name: true } } },
+    });
     // compare even when not found is unnecessary here; reject uniformly
     if (!staff || !(await this.passwords.compare(password, staff.loginCredentials))) {
       throw new UnauthorizedException('invalid credentials');
@@ -88,13 +95,23 @@ export class AuthService {
       sub: staff.id,
       role,
       clinicId: staff.clinicId,
+      hospitalId: staff.hospitalId,
     });
-    return { token, role, sub: staff.id };
+    return {
+      token,
+      role,
+      sub: staff.id,
+      hospitalId: staff.hospitalId,
+      hospitalName: staff.hospital.name,
+    };
   }
 
   // ── doctor login (username/password) ─────────────────────
   async doctorLogin(username: string, password: string): Promise<AuthResult> {
-    const doctor = await this.prisma.doctor.findUnique({ where: { username } });
+    const doctor = await this.prisma.doctor.findUnique({
+      where: { username },
+      include: { clinic: { select: { hospitalId: true, hospital: { select: { name: true } } } } },
+    });
     if (
       !doctor ||
       !doctor.passwordHash ||
@@ -102,12 +119,20 @@ export class AuthService {
     ) {
       throw new UnauthorizedException('invalid credentials');
     }
+    const hospitalId = doctor.clinic.hospitalId;
     const token = this.tokens.sign({
       sub: doctor.id,
       role: 'DOCTOR',
       doctorId: doctor.id,
       clinicId: doctor.clinicId,
+      hospitalId,
     });
-    return { token, role: 'DOCTOR', sub: doctor.id };
+    return {
+      token,
+      role: 'DOCTOR',
+      sub: doctor.id,
+      hospitalId,
+      hospitalName: doctor.clinic.hospital.name,
+    };
   }
 }

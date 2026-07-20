@@ -6,15 +6,19 @@ import {
   NotFoundException,
   Post,
   Query,
+  Req,
   UseGuards,
 } from '@nestjs/common';
-import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import type { SessionType } from '@prisma/client';
+import { AuthedRequest, JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { SessionClaims } from '../auth/auth-token.service';
 import { RolesGuard } from '../auth/roles.guard';
 import { Roles } from '../auth/roles.decorator';
 import { TokenSource } from './token.service';
 import { QueueService } from './queue.service';
 import { EtaService } from './eta.service';
 import { ConsultationService } from './consultation.service';
+import { AuditAction, AuditService } from './audit.service';
 import { IssueTokenDto } from './dto/issue-token.dto';
 
 /**
@@ -35,6 +39,7 @@ export class QueueEngineController {
     private readonly queueService: QueueService,
     private readonly etaService: EtaService,
     private readonly consultationService: ConsultationService,
+    private readonly audit: AuditService,
   ) {}
 
   @Get('position')
@@ -89,42 +94,59 @@ export class QueueEngineController {
   // ── DONE: advance the queue (rank-0 completes, next promoted) ──
   @Post('done')
   async done(
+    @Req() req: AuthedRequest,
     @Body() body: IssueTokenDto & { expectedToken?: string },
   ) {
     this.validate(body);
-    return this.consultationService.markDone(body, body.expectedToken ?? '');
+    const result = await this.consultationService.markDone(body, body.expectedToken ?? '');
+    await this.log(req, 'DONE', body, {
+      token: body.expectedToken,
+      metadata: { expectedToken: body.expectedToken },
+    });
+    return result;
   }
 
   // ── no-show: remove a specific token (not marked seen) ────
   @Post('no-show')
-  async noShow(@Body() body: IssueTokenDto & { token?: string }) {
+  async noShow(@Req() req: AuthedRequest, @Body() body: IssueTokenDto & { token?: string }) {
     this.validate(body);
     if (!body.token) throw new BadRequestException('token is required');
-    return this.consultationService.markNoShow(body, body.token);
+    const result = await this.consultationService.markNoShow(body, body.token);
+    await this.log(req, 'NO_SHOW', body, { token: body.token });
+    return result;
   }
 
   // ── skip: move a token to the back of the queue ──────────
   @Post('skip')
-  async skip(@Body() body: IssueTokenDto & { token?: string }) {
+  async skip(@Req() req: AuthedRequest, @Body() body: IssueTokenDto & { token?: string }) {
     this.validate(body);
     if (!body.token) throw new BadRequestException('token is required');
-    return this.consultationService.skip(body, body.token);
+    const result = await this.consultationService.skip(body, body.token);
+    await this.log(req, 'SKIP', body, { token: body.token });
+    return result;
   }
 
   // ── emergency priority: insert a new booking near the front ──
   @Post('priority')
   async priority(
+    @Req() req: AuthedRequest,
     @Body() body: IssueTokenDto & { source?: string; bookingId?: string },
   ) {
     this.validate(body);
     if (!body.bookingId) throw new BadRequestException('bookingId is required');
     const source = this.parseSource(body.source);
-    return this.consultationService.priorityInsert(source, body, body.bookingId);
+    const result = await this.consultationService.priorityInsert(source, body, body.bookingId);
+    await this.log(req, 'PRIORITY', body, {
+      bookingId: body.bookingId,
+      metadata: { source },
+    });
+    return result;
   }
 
   // ── reinsert: place a NO_SHOW patient after an anchor token ──
   @Post('reinsert')
   async reinsert(
+    @Req() req: AuthedRequest,
     @Body()
     body: IssueTokenDto & {
       token?: string;
@@ -138,15 +160,40 @@ export class QueueEngineController {
         'token, afterToken and bookingId are required',
       );
     }
-    return this.consultationService.reinsert(
+    const result = await this.consultationService.reinsert(
       body,
       body.token,
       body.afterToken,
       body.bookingId,
     );
+    await this.log(req, 'REINSERT', body, {
+      token: body.token,
+      bookingId: body.bookingId,
+      metadata: { afterToken: body.afterToken },
+    });
+    return result;
   }
 
   // ── helpers ──────────────────────────────────────────────
+  /** Record the action against the authenticated actor (compliance trail). */
+  private log(
+    req: AuthedRequest,
+    action: AuditAction,
+    body: IssueTokenDto,
+    target: { token?: string; bookingId?: string; metadata?: Record<string, unknown> },
+  ): Promise<void> {
+    const actor = req.user as SessionClaims; // guard guarantees this is set
+    return this.audit.record(actor, {
+      action,
+      doctorId: body.doctorId,
+      sessionDate: body.sessionDate,
+      sessionType: body.sessionType as SessionType,
+      token: target.token,
+      bookingId: target.bookingId,
+      metadata: target.metadata,
+    });
+  }
+
   private parseSource(raw?: string): TokenSource {
     switch (raw) {
       case 'APP':

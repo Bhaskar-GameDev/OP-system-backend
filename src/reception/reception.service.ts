@@ -1,11 +1,12 @@
 import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
-import { BookingSource, BookingStatus, SessionType } from '@prisma/client';
+import { BookingSource, BookingStatus, PaymentStatus, SessionType } from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { ConsultationService } from '../queue-engine/consultation.service';
 import { SessionKey, TokenSource } from '../queue-engine/token.service';
 import {
   BookingRosterView,
   CheckInView,
+  CollectPaymentView,
   ReceptionDoctorView,
   RegisterWalkInInput,
   WalkInView,
@@ -150,11 +151,47 @@ export class ReceptionService {
         source: true,
         status: true,
         checkedInAt: true,
+        payAtDesk: true,
+        payment: { select: { status: true } },
         patient: { select: { name: true } },
       },
       orderBy: { tokenNumber: 'asc' },
     });
     return rows.map(toBookingRosterView);
+  }
+
+  /**
+   * Collect a pay-at-desk payment (cash/UPI taken at reception) for a voice
+   * booking. Flips the attached Payment to SUCCESS — the booking already holds a
+   * token, so nothing about the queue changes. Clinic-scoped like everything else
+   * here; idempotent (a second collect on an already-paid booking is a no-op).
+   */
+  async collectPayment(
+    clinicId: string,
+    bookingId: string,
+  ): Promise<CollectPaymentView> {
+    const booking = await this.prisma.booking.findUnique({
+      where: { id: bookingId },
+      select: {
+        id: true,
+        doctor: { select: { clinicId: true } },
+        payment: { select: { id: true, amount: true, status: true } },
+      },
+    });
+    if (!booking) throw new NotFoundException('booking not found');
+    if (booking.doctor.clinicId !== clinicId) {
+      throw new ForbiddenException('booking belongs to another clinic');
+    }
+    if (!booking.payment) {
+      throw new NotFoundException('no payment is attached to this booking');
+    }
+    if (booking.payment.status !== PaymentStatus.SUCCESS) {
+      await this.prisma.payment.update({
+        where: { id: booking.payment.id },
+        data: { status: PaymentStatus.SUCCESS },
+      });
+    }
+    return { bookingId: booking.id, paid: true, amountPaise: booking.payment.amount };
   }
 
   /** Doctors in the caller's clinic, for the queue-monitoring picker. */

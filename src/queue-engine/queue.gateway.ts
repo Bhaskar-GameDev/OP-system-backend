@@ -11,6 +11,7 @@ import {
 } from '@nestjs/websockets';
 import type { Server, Socket } from 'socket.io';
 import { PrismaService } from '../common/prisma/prisma.service';
+import { TenantService } from '../common/tenant/tenant.service';
 import {
   AuthTokenService,
   SessionClaims,
@@ -49,6 +50,8 @@ export class QueueGateway
 {
   private readonly logger = new Logger(QueueGateway.name);
   private unsubscribe?: () => void;
+  /** Per-session set of booking ids that were in the queue at the last broadcast. */
+  private lastSessionBookings = new Map<string, Set<string>>();
 
   @WebSocketServer()
   server!: Server;
@@ -59,6 +62,7 @@ export class QueueGateway
     private readonly queue: QueueService,
     private readonly events: QueueEventsService,
     private readonly prisma: PrismaService,
+    private readonly tenant: TenantService,
   ) {}
 
   onModuleInit(): void {
@@ -163,7 +167,13 @@ export class QueueGateway
     if (claims.role === 'DOCTOR') {
       return claims.doctorId === session.doctorId;
     }
-    if (claims.role === 'STAFF' || claims.role === 'ADMIN') {
+    if (claims.role === 'ADMIN') {
+      // ADMIN may watch any doctor's queue in their OWN hospital — never another
+      // hospital's. The doctor->clinic->hospital check is the tenant boundary.
+      if (!claims.hospitalId) return false;
+      return this.tenant.doctorInHospital(claims.hospitalId, session.doctorId);
+    }
+    if (claims.role === 'STAFF') {
       // only sessions for doctors in the staff member's clinic
       if (!claims.clinicId) return false;
       const doctor = await this.prisma.doctor.findUnique({
@@ -183,14 +193,33 @@ export class QueueGateway
     this.server.to(sessionRoom(session)).emit('queue:update', { session, queue });
 
     // each patient gets ONLY their own slice on their private channel
+    const current = new Set<string>();
     for (const entry of queue) {
       const bookingId = await this.queue.bookingIdFor(entry.tokenNumber, session);
       if (bookingId) {
+        current.add(bookingId);
         this.server
           .to(bookingRoom(bookingId))
           .emit('eta:update', { booking: bookingId, eta: entry });
       }
     }
+
+    // Bookings that LEFT the queue since the last broadcast (DONE / no-show /
+    // cancelled) get a final eta:update with eta=null, so the patient's OWN
+    // terminal transition is pushed live — the loop above only covers tokens
+    // still queued, which would otherwise strand the just-completed patient.
+    const tag = sessionRoom(session);
+    const previous = this.lastSessionBookings.get(tag);
+    if (previous) {
+      for (const bookingId of previous) {
+        if (!current.has(bookingId)) {
+          this.server
+            .to(bookingRoom(bookingId))
+            .emit('eta:update', { booking: bookingId, eta: null });
+        }
+      }
+    }
+    this.lastSessionBookings.set(tag, current);
   }
 }
 

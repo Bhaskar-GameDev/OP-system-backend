@@ -9,16 +9,20 @@ import {
 import { AuthedRequest, JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { RolesGuard } from '../auth/roles.guard';
 import { Roles } from '../auth/roles.decorator';
+import { TenantScopeGuard } from '../common/tenant/tenant-scope';
 import { AnalyticsService } from './analytics.service';
 import { adminClinicId } from './admin-scope';
 
 /**
- * Analytics read surface. ADMIN-only, scoped to the admin's own clinic via the
- * token. Serves precomputed analytics_daily rows only — never scans bookings or
- * booking_history at read time.
+ * Analytics read surface. ADMIN-only. Scope is the admin's OWN home clinic
+ * (token.clinicId) — it is structurally tenant-isolated: the clinic id comes
+ * from the token, never a param, so an admin can never read another clinic's
+ * (or hospital's) analytics_daily rows. Hospital-wide aggregation lives in the
+ * reports surface (/admin/reports). Serves precomputed analytics_daily rows
+ * only — never scans bookings or booking_history at read time.
  */
 @Controller('admin/analytics')
-@UseGuards(JwtAuthGuard, RolesGuard)
+@UseGuards(JwtAuthGuard, RolesGuard, TenantScopeGuard)
 @Roles('ADMIN')
 export class AnalyticsController {
   constructor(private readonly analytics: AnalyticsService) {}

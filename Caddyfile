@@ -1,0 +1,7 @@
+# Patient Flow OS reverse proxy.
+# Caddy fetches + renews Let's Encrypt certs automatically for {$DOMAIN}.
+# The only knob is the DOMAIN env var (set in .env.production).
+{$DOMAIN} {
+	encode gzip
+	reverse_proxy backend:3000
+}

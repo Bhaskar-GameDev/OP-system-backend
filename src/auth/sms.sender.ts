@@ -25,7 +25,49 @@ export class Msg91SmsSender implements SmsSender {
       this.logger.warn(`[DEV] OTP for ${mobile}: ${otp}`);
       return;
     }
-    // TODO: real MSG91 HTTP request (template + sender id from config).
-    this.logger.log(`OTP dispatched to ${mobile} via MSG91`);
+
+    const templateId = this.config.get<string>('MSG91_OTP_TEMPLATE_ID');
+    const senderId = this.config.get<string>('MSG91_SENDER_ID');
+    const recipient = this.normalizeMobile(mobile);
+
+    // MSG91 v5 OTP API — we pass our own OTP value so it matches what we store.
+    const url = new URL('https://control.msg91.com/api/v5/otp');
+    url.searchParams.set('otp', otp);
+    url.searchParams.set('mobile', recipient);
+    if (templateId) url.searchParams.set('template_id', templateId);
+    if (senderId) url.searchParams.set('sender', senderId);
+
+    let res: Response;
+    try {
+      res = await fetch(url.toString(), {
+        method: 'POST',
+        headers: { authkey: authKey, accept: 'application/json' },
+      });
+    } catch (err) {
+      this.logger.error(`MSG91 request failed for ${recipient}: ${(err as Error).message}`);
+      throw err;
+    }
+
+    const bodyText = await res.text();
+    // MSG91 returns 200 with { type: 'success' | 'error', message } — a 200 alone
+    // is not proof of delivery, so inspect the payload too.
+    let type: string | undefined;
+    try {
+      type = (JSON.parse(bodyText) as { type?: string }).type;
+    } catch {
+      /* non-JSON body — fall through to status check */
+    }
+    if (!res.ok || type === 'error') {
+      this.logger.error(`MSG91 rejected OTP for ${recipient}: ${res.status} ${bodyText}`);
+      throw new Error(`MSG91 send failed: ${res.status}`);
+    }
+
+    this.logger.log(`OTP dispatched to ${recipient} via MSG91`);
+  }
+
+  /** Strip formatting and ensure a country code (defaults to India 91). */
+  private normalizeMobile(mobile: string): string {
+    const digits = mobile.replace(/\D/g, '');
+    return digits.length === 10 ? `91${digits}` : digits;
   }
 }

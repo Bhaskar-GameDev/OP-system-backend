@@ -7,16 +7,20 @@ export type Role = 'PATIENT' | 'DOCTOR' | 'STAFF' | 'ADMIN';
 /**
  * Session-token claims. `sub` is the authenticated identity; each role carries
  * the scope it may access:
- *  - PATIENT -> sub = patientId (may access bookings they own)
- *  - DOCTOR  -> sub = doctorId, doctorId set (their own session only)
- *  - STAFF   -> sub = staffId, clinicId set (their clinic's sessions)
- *  - ADMIN   -> sub = staffId, clinicId set (clinic-wide)
+ *  - PATIENT -> sub = patientId (may access bookings they own); no tenant scope
+ *  - DOCTOR  -> sub = doctorId, doctorId + clinicId + hospitalId set
+ *  - STAFF   -> sub = staffId, clinicId + hospitalId set (their clinic)
+ *  - ADMIN   -> sub = staffId, clinicId (home) + hospitalId set (hospital-wide)
+ *
+ * `hospitalId` is the tenant boundary for every staff/doctor role — the shared
+ * enforcement layer (TenantService) filters all staff-side queries by it.
  */
 export interface SessionClaims {
   sub: string;
   role: Role;
   doctorId?: string;
   clinicId?: string;
+  hospitalId?: string;
   exp?: number; // unix seconds
 }
 

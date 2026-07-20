@@ -8,7 +8,7 @@ services:
       POSTGRES_PASSWORD: pfos_local_pw
       POSTGRES_DB: patient_flow_os
     ports:
-      - "5433:5432"
+      - "5432:5432"
     volumes:
       - pfos_pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -31,6 +31,30 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  backend:
+    build: .
+    container_name: pfos_backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgresql://pfos:pfos_local_pw@postgres:5432/patient_flow_os?schema=public
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      JWT_SECRET: demo_only_change_me_in_production_0123456789
+      OTP_EXPIRY_SECONDS: 300
+      # Allow local desktop/web clients to call the containerised API.
+      CORS_ORIGINS: "http://localhost:1420,http://tauri.localhost,https://tauri.localhost,http://localhost:19006,http://localhost:8081"
+      # External integrations unset -> dev fallbacks (OTP logged to backend
+      # logs, fake payments auto-confirm, push logged). See SETUP.md for real keys.
+    ports:
+      - "3000:3000"
 
 volumes:
   pfos_pgdata:

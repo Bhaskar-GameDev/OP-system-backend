@@ -6,9 +6,12 @@ import { ConsultationService } from './consultation.service';
 import { QueueEventsService } from './queue-events.service';
 import { QueueGateway } from './queue.gateway';
 import { QueueEngineController } from './queue-engine.controller';
+import { QueueStatusController } from './queue-status.controller';
+import { AuditLogController } from './audit-log.controller';
+import { AuditService } from './audit.service';
 
 @Module({
-  controllers: [QueueEngineController],
+  controllers: [QueueEngineController, QueueStatusController, AuditLogController],
   providers: [
     TokenService,
     QueueService,
@@ -16,6 +19,7 @@ import { QueueEngineController } from './queue-engine.controller';
     ConsultationService,
     QueueEventsService,
     QueueGateway,
+    AuditService,
   ],
   exports: [
     TokenService,
@@ -23,6 +27,7 @@ import { QueueEngineController } from './queue-engine.controller';
     EtaService,
     ConsultationService,
     QueueEventsService,
+    AuditService,
   ],
 })
 export class QueueEngineModule {}

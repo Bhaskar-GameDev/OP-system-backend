@@ -1,4 +1,4 @@
-import { StaffRole } from '@prisma/client';
+import { SessionType, StaffRole } from '@prisma/client';
 
 /**
  * Admin-portal projection DTOs. Like Discovery, every mapper builds a FRESH
@@ -24,7 +24,17 @@ export interface AdminDoctorView {
   specialization: string | null;
   consultationFee: number;
   avgConsultMinutes: number;
+  photoUrl: string | null;
   username: string | null;
+}
+
+export interface AdminDoctorSessionView {
+  id: string;
+  doctorId: string;
+  sessionType: SessionType;
+  startTime: string; // "HH:MM"
+  maxTokens: number;
+  daysOfWeek: number[]; // 0=Sun … 6=Sat
 }
 
 export interface AdminStaffView {
@@ -50,7 +60,16 @@ type DoctorLike = {
   specialization?: string | null;
   consultationFee: number;
   avgConsultMinutes: number;
+  photoUrl?: string | null;
   username?: string | null;
+};
+type DoctorSessionLike = {
+  id: string;
+  doctorId: string;
+  sessionType: SessionType;
+  startTime: string;
+  maxTokens: number;
+  daysOfWeek: number[];
 };
 type StaffLike = {
   id: string;
@@ -77,7 +96,19 @@ export function toAdminDoctor(d: DoctorLike): AdminDoctorView {
     specialization: d.specialization ?? null,
     consultationFee: d.consultationFee,
     avgConsultMinutes: d.avgConsultMinutes,
+    photoUrl: d.photoUrl ?? null,
     username: d.username ?? null,
+  };
+}
+
+export function toAdminDoctorSession(s: DoctorSessionLike): AdminDoctorSessionView {
+  return {
+    id: s.id,
+    doctorId: s.doctorId,
+    sessionType: s.sessionType,
+    startTime: s.startTime,
+    maxTokens: s.maxTokens,
+    daysOfWeek: s.daysOfWeek,
   };
 }
 
@@ -93,6 +124,12 @@ export function toAdminStaff(s: StaffLike): AdminStaffView {
 
 // ─── Write inputs ───
 
+export interface CreateClinicInput {
+  name: string;
+  address?: string | null;
+  contactNumber?: string | null;
+}
+
 export interface UpdateClinicInput {
   name?: string;
   address?: string | null;
@@ -104,6 +141,7 @@ export interface CreateDoctorInput {
   specialization?: string | null;
   consultationFee?: number;
   avgConsultMinutes?: number;
+  photoUrl?: string | null;
   username?: string;
   password?: string;
 }
@@ -113,8 +151,23 @@ export interface UpdateDoctorInput {
   specialization?: string | null;
   consultationFee?: number;
   avgConsultMinutes?: number;
+  photoUrl?: string | null;
   username?: string;
   password?: string;
+}
+
+export interface CreateDoctorSessionInput {
+  sessionType: SessionType;
+  startTime: string; // "HH:MM"
+  maxTokens: number;
+  daysOfWeek: number[]; // 0=Sun … 6=Sat, non-empty
+}
+
+export interface UpdateDoctorSessionInput {
+  sessionType?: SessionType;
+  startTime?: string;
+  maxTokens?: number;
+  daysOfWeek?: number[];
 }
 
 export interface CreateStaffInput {

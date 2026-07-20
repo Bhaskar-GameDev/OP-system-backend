@@ -4,20 +4,26 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
+import { Prisma, SessionType } from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
+import { TenantService } from '../common/tenant/tenant.service';
 import { PasswordService } from '../auth/password.service';
 import {
   AdminClinicView,
+  AdminDoctorSessionView,
   AdminDoctorView,
   AdminStaffView,
+  CreateClinicInput,
   CreateDoctorInput,
+  CreateDoctorSessionInput,
   CreateStaffInput,
   UpdateClinicInput,
   UpdateDoctorInput,
+  UpdateDoctorSessionInput,
   UpdateStaffInput,
   toAdminClinic,
   toAdminDoctor,
+  toAdminDoctorSession,
   toAdminStaff,
 } from './admin.dto';
 
@@ -38,8 +44,18 @@ const DOCTOR_SELECT = {
   specialization: true,
   consultationFee: true,
   avgConsultMinutes: true,
+  photoUrl: true,
   username: true,
 } satisfies Prisma.DoctorSelect;
+
+const SESSION_SELECT = {
+  id: true,
+  doctorId: true,
+  sessionType: true,
+  startTime: true,
+  maxTokens: true,
+  daysOfWeek: true,
+} satisfies Prisma.DoctorSessionSelect;
 
 const STAFF_SELECT = {
   id: true,
@@ -67,6 +83,7 @@ export class AdminService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly passwords: PasswordService,
+    private readonly tenant: TenantService,
   ) {}
 
   // ─── Clinic (edit-only, own clinic) ───
@@ -101,6 +118,42 @@ export class AdminService {
     }
   }
 
+  // ─── Clinics (hospital-scoped: an ADMIN's sibling clinics) ───
+  // An ADMIN manages every clinic under their OWN hospital — list/get/create are
+  // bounded to the token's hospitalId. A clinic in another hospital is treated as
+  // not-found (no cross-tenant existence leak).
+
+  async listClinics(hospitalId: string): Promise<AdminClinicView[]> {
+    const rows = await this.prisma.clinic.findMany({
+      where: { hospitalId },
+      select: CLINIC_SELECT,
+      orderBy: { name: 'asc' },
+    });
+    return rows.map(toAdminClinic);
+  }
+
+  async getClinicById(hospitalId: string, clinicId: string): Promise<AdminClinicView> {
+    await this.tenant.assertClinicInHospital(hospitalId, clinicId);
+    return this.getClinic(clinicId);
+  }
+
+  async createClinic(
+    hospitalId: string,
+    input: CreateClinicInput,
+  ): Promise<AdminClinicView> {
+    const created = await this.prisma.clinic.create({
+      data: {
+        // hospitalId is taken from the TOKEN scope, never from the request body.
+        hospital: { connect: { id: hospitalId } },
+        name: req(input.name, 'name'),
+        address: input.address ?? null,
+        contactNumber: input.contactNumber ?? null,
+      },
+      select: CLINIC_SELECT,
+    });
+    return toAdminClinic(created);
+  }
+
   // ─── Doctor CRUD (own clinic) ───
 
   async listDoctors(clinicId: string): Promise<AdminDoctorView[]> {
@@ -126,8 +179,9 @@ export class AdminService {
         clinicId,
         name: req(input.name, 'name'),
         specialization: input.specialization ?? null,
-        consultationFee: input.consultationFee ?? 0,
+        consultationFee: positiveFee(input.consultationFee) ?? 0,
         avgConsultMinutes: input.avgConsultMinutes ?? 10,
+        photoUrl: input.photoUrl ?? null,
         username: input.username ?? null,
         passwordHash: input.password
           ? await this.passwords.hash(input.password)
@@ -148,8 +202,9 @@ export class AdminService {
     const data: Prisma.DoctorUpdateInput = {};
     if (input.name !== undefined) data.name = req(input.name, 'name');
     if (input.specialization !== undefined) data.specialization = input.specialization;
-    if (input.consultationFee !== undefined) data.consultationFee = input.consultationFee;
+    if (input.consultationFee !== undefined) data.consultationFee = positiveFee(input.consultationFee);
     if (input.avgConsultMinutes !== undefined) data.avgConsultMinutes = input.avgConsultMinutes;
+    if (input.photoUrl !== undefined) data.photoUrl = input.photoUrl;
     if (input.username !== undefined) data.username = input.username;
     if (input.password !== undefined) data.passwordHash = await this.passwords.hash(input.password);
 
@@ -182,12 +237,15 @@ export class AdminService {
   }
 
   async createStaff(
+    hospitalId: string,
     clinicId: string,
     input: CreateStaffInput,
   ): Promise<AdminStaffView> {
     const created = await this.prisma.staff.create({
       data: {
-        clinicId, // from token scope, never the request body
+        // both scopes come from the token, never the request body
+        hospitalId,
+        clinicId,
         name: req(input.name, 'name'),
         role: input.role,
         username: input.username ?? null,
@@ -222,6 +280,126 @@ export class AdminService {
   async deleteStaff(clinicId: string, staffId: string): Promise<void> {
     await this.loadOwnStaff(clinicId, staffId);
     await this.prisma.staff.delete({ where: { id: staffId } });
+  }
+
+  // ─── Doctor session schedule (per doctor, own clinic) ───
+
+  async listSessions(
+    clinicId: string,
+    doctorId: string,
+  ): Promise<AdminDoctorSessionView[]> {
+    await this.loadOwnDoctor(clinicId, doctorId); // 403/404 before reading
+    const rows = await this.prisma.doctorSession.findMany({
+      where: { doctorId },
+      select: SESSION_SELECT,
+      orderBy: [{ sessionType: 'asc' }, { startTime: 'asc' }],
+    });
+    return rows.map(toAdminDoctorSession);
+  }
+
+  async createSession(
+    clinicId: string,
+    doctorId: string,
+    input: CreateDoctorSessionInput,
+  ): Promise<AdminDoctorSessionView> {
+    await this.loadOwnDoctor(clinicId, doctorId);
+
+    const sessionType = parseSessionType(input.sessionType);
+    const startTime = parseStartTime(input.startTime);
+    const maxTokens = parseMaxTokens(input.maxTokens);
+    const daysOfWeek = parseDays(input.daysOfWeek);
+
+    await this.assertNoOverlap(doctorId, sessionType, daysOfWeek, null);
+
+    const created = await this.prisma.doctorSession.create({
+      data: { doctorId, sessionType, startTime, maxTokens, daysOfWeek },
+      select: SESSION_SELECT,
+    });
+    return toAdminDoctorSession(created);
+  }
+
+  async updateSession(
+    clinicId: string,
+    doctorId: string,
+    sessionId: string,
+    input: UpdateDoctorSessionInput,
+  ): Promise<AdminDoctorSessionView> {
+    await this.loadOwnDoctor(clinicId, doctorId);
+    const existing = await this.prisma.doctorSession.findUnique({
+      where: { id: sessionId },
+      select: SESSION_SELECT,
+    });
+    if (!existing || existing.doctorId !== doctorId) {
+      throw new NotFoundException('session not found');
+    }
+
+    const data: Prisma.DoctorSessionUpdateInput = {};
+    const nextType =
+      input.sessionType !== undefined
+        ? parseSessionType(input.sessionType)
+        : existing.sessionType;
+    const nextDays =
+      input.daysOfWeek !== undefined ? parseDays(input.daysOfWeek) : existing.daysOfWeek;
+    if (input.sessionType !== undefined) data.sessionType = nextType;
+    if (input.startTime !== undefined) data.startTime = parseStartTime(input.startTime);
+    if (input.maxTokens !== undefined) data.maxTokens = parseMaxTokens(input.maxTokens);
+    if (input.daysOfWeek !== undefined) data.daysOfWeek = nextDays;
+
+    // Re-check overlap against the resulting (type, days), ignoring this row.
+    await this.assertNoOverlap(doctorId, nextType, nextDays, sessionId);
+
+    const updated = await this.prisma.doctorSession.update({
+      where: { id: sessionId },
+      data,
+      select: SESSION_SELECT,
+    });
+    return toAdminDoctorSession(updated);
+  }
+
+  async deleteSession(
+    clinicId: string,
+    doctorId: string,
+    sessionId: string,
+  ): Promise<void> {
+    await this.loadOwnDoctor(clinicId, doctorId);
+    const existing = await this.prisma.doctorSession.findUnique({
+      where: { id: sessionId },
+      select: { id: true, doctorId: true },
+    });
+    if (!existing || existing.doctorId !== doctorId) {
+      throw new NotFoundException('session not found');
+    }
+    await this.prisma.doctorSession.delete({ where: { id: sessionId } });
+  }
+
+  /**
+   * Overlap rule: a doctor may not hold two schedules of the SAME session type
+   * that share a weekday. Checks all other rows of that type for a day-set
+   * intersection. `ignoreId` excludes the row being updated.
+   */
+  private async assertNoOverlap(
+    doctorId: string,
+    sessionType: SessionType,
+    daysOfWeek: number[],
+    ignoreId: string | null,
+  ): Promise<void> {
+    const siblings = await this.prisma.doctorSession.findMany({
+      where: {
+        doctorId,
+        sessionType,
+        ...(ignoreId ? { id: { not: ignoreId } } : {}),
+      },
+      select: { daysOfWeek: true },
+    });
+    const wanted = new Set(daysOfWeek);
+    for (const s of siblings) {
+      const clash = s.daysOfWeek.find((d) => wanted.has(d));
+      if (clash !== undefined) {
+        throw new BadRequestException(
+          `overlapping ${sessionType} session on day ${clash} (same day + session type)`,
+        );
+      }
+    }
   }
 
   // ─── Scope enforcement ───
@@ -261,6 +439,48 @@ function req(v: string | undefined, field: string): string {
     throw new BadRequestException(`${field} is required`);
   }
   return v;
+}
+
+/** Consultation fee must be a positive integer (in rupees). */
+function positiveFee(v: number | undefined): number | undefined {
+  if (v === undefined) return undefined;
+  if (!Number.isInteger(v) || v <= 0) {
+    throw new BadRequestException('consultationFee must be a positive integer');
+  }
+  return v;
+}
+
+function parseSessionType(v: SessionType): SessionType {
+  if (v !== SessionType.MORNING && v !== SessionType.EVENING) {
+    throw new BadRequestException('sessionType must be MORNING or EVENING');
+  }
+  return v;
+}
+
+function parseStartTime(v: string): string {
+  if (typeof v !== 'string' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(v)) {
+    throw new BadRequestException('startTime must be "HH:MM" (24h)');
+  }
+  return v;
+}
+
+function parseMaxTokens(v: number): number {
+  if (!Number.isInteger(v) || v <= 0) {
+    throw new BadRequestException('maxTokens must be a positive integer');
+  }
+  return v;
+}
+
+function parseDays(v: number[]): number[] {
+  if (!Array.isArray(v) || v.length === 0) {
+    throw new BadRequestException('daysOfWeek must be a non-empty array');
+  }
+  for (const d of v) {
+    if (!Number.isInteger(d) || d < 0 || d > 6) {
+      throw new BadRequestException('daysOfWeek entries must be integers 0–6 (Sun–Sat)');
+    }
+  }
+  return [...new Set(v)].sort((a, b) => a - b);
 }
 
 function notFoundIfMissing(e: unknown, message: string): unknown {

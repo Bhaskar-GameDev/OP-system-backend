@@ -37,6 +37,10 @@ export interface BookingRosterView {
   status: string;
   arrived: boolean;
   checkedInAt: string | null; // ISO8601, or null if not arrived
+  // Payment settle state — relevant to voice "pay-at-desk" tokens the desk
+  // collects on arrival. paid = an attached Payment at status SUCCESS.
+  payAtDesk: boolean;
+  paid: boolean;
 }
 
 type RosterRow = {
@@ -45,6 +49,8 @@ type RosterRow = {
   source: string;
   status: string;
   checkedInAt: Date | null;
+  payAtDesk: boolean;
+  payment: { status: string } | null;
   patient: { name: string };
 };
 
@@ -57,7 +63,16 @@ export function toBookingRosterView(b: RosterRow): BookingRosterView {
     status: b.status,
     arrived: b.checkedInAt !== null,
     checkedInAt: b.checkedInAt ? b.checkedInAt.toISOString() : null,
+    payAtDesk: b.payAtDesk,
+    paid: b.payment?.status === 'SUCCESS',
   };
+}
+
+/** Result of a desk payment collection. */
+export interface CollectPaymentView {
+  bookingId: string;
+  paid: boolean;
+  amountPaise: number;
 }
 
 /**

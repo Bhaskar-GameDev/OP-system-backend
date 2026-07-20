@@ -10,10 +10,21 @@ import {
  * discipline as Discovery: fresh object, explicit allow-list, never a spread of
  * a raw model — no internal/auth fields can reach the wire.
  */
+/** Denormalized doctor/clinic facts, batched by the service to avoid N+1. */
+export interface DoctorInfo {
+  name: string;
+  fee: number;
+  clinicId: string;
+  clinicName: string;
+}
+
 export interface PublicBooking {
   id: string;
   doctorId: string;
   doctorName: string | null;
+  clinicId: string | null;
+  clinicName: string | null;
+  fee: number | null;
   source: BookingSource;
   tokenNumber: string | null;
   sessionDate: string; // YYYY-MM-DD
@@ -24,6 +35,11 @@ export interface PublicBooking {
   consultationEndedAt: string | null;
   createdAt: string; // ISO
   archived: boolean; // true if sourced from booking_history
+  // Patient self-service eligibility (computed for live upcoming bookings only;
+  // always false for past/archived). True = booking still waiting (status BOOKED),
+  // not yet called. No time cutoff (removed with same-day booking).
+  cancellable: boolean;
+  reschedulable: boolean;
 }
 
 export interface Page<T> {
@@ -54,22 +70,27 @@ type LiveBooking = {
 type HistoryBooking = {
   bookingId: string;
   doctorId: string;
+  clinicId: string;
   source: BookingSource;
   tokenNumber: string | null;
   sessionDate: Date;
   sessionType: SessionType;
   finalStatus: BookingStatus;
+  paymentAmount: number | null;
   paymentStatus: PaymentStatus | null;
   consultationStartedAt: Date | null;
   consultationEndedAt: Date | null;
   bookedAt: Date;
 };
 
-export function toPublicFromLive(b: LiveBooking, doctorName: string | null): PublicBooking {
+export function toPublicFromLive(b: LiveBooking, doctor: DoctorInfo | null): PublicBooking {
   return {
     id: b.id,
     doctorId: b.doctorId,
-    doctorName,
+    doctorName: doctor?.name ?? null,
+    clinicId: doctor?.clinicId ?? null,
+    clinicName: doctor?.clinicName ?? null,
+    fee: doctor?.fee ?? null,
     source: b.source,
     tokenNumber: b.tokenNumber,
     sessionDate: isoDate(b.sessionDate),
@@ -80,14 +101,21 @@ export function toPublicFromLive(b: LiveBooking, doctorName: string | null): Pub
     consultationEndedAt: iso(b.consultationEndedAt),
     createdAt: iso(b.createdAt) as string,
     archived: false,
+    // default ineligible; upcoming() upgrades these where the rule is met
+    cancellable: false,
+    reschedulable: false,
   };
 }
 
-export function toPublicFromHistory(h: HistoryBooking, doctorName: string | null): PublicBooking {
+export function toPublicFromHistory(h: HistoryBooking, doctor: DoctorInfo | null): PublicBooking {
   return {
     id: h.bookingId,
     doctorId: h.doctorId,
-    doctorName,
+    doctorName: doctor?.name ?? null,
+    // history carries its own clinicId snapshot; fee = what was actually paid
+    clinicId: h.clinicId,
+    clinicName: doctor?.clinicName ?? null,
+    fee: h.paymentAmount ?? doctor?.fee ?? null,
     source: h.source,
     tokenNumber: h.tokenNumber,
     sessionDate: isoDate(h.sessionDate),
@@ -98,5 +126,7 @@ export function toPublicFromHistory(h: HistoryBooking, doctorName: string | null
     consultationEndedAt: iso(h.consultationEndedAt),
     createdAt: iso(h.bookedAt) as string,
     archived: true,
+    cancellable: false, // archived/terminal bookings are never actionable
+    reschedulable: false,
   };
 }

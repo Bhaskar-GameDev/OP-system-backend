@@ -22,6 +22,7 @@ describe('Admin Portal (full stack)', () => {
   let tokens: AuthTokenService;
   let analytics: AnalyticsService;
 
+  const HOSPITAL = 'admin-hosp';
   const CLINIC_A = 'admin-clinic-a';
   const CLINIC_B = 'admin-clinic-b';
   const DOCTOR_A = 'admin-doc-a';
@@ -47,10 +48,15 @@ describe('Admin Portal (full stack)', () => {
 
     await cleanup();
 
+    await prisma.hospital.upsert({
+      where: { id: HOSPITAL },
+      update: {},
+      create: { id: HOSPITAL, name: 'Admin Hospital' },
+    });
     await prisma.clinic.createMany({
       data: [
-        { id: CLINIC_A, name: 'Clinic A' },
-        { id: CLINIC_B, name: 'Clinic B' },
+        { id: CLINIC_A, hospitalId: HOSPITAL, name: 'Clinic A' },
+        { id: CLINIC_B, hospitalId: HOSPITAL, name: 'Clinic B' },
       ],
     });
     await prisma.doctor.createMany({
@@ -60,8 +66,9 @@ describe('Admin Portal (full stack)', () => {
       ],
     });
 
-    // ADMIN token for Clinic A — scope carried as clinicId, sub = some staff id.
-    adminAToken = tokens.sign({ sub: 'admin-a-staff', role: 'ADMIN', clinicId: CLINIC_A });
+    // ADMIN token for Clinic A — clinicId is the home clinic; hospitalId is the
+    // tenant scope. Doctor CRUD stays clinic-scoped (A cannot touch B's doctor).
+    adminAToken = tokens.sign({ sub: 'admin-a-staff', role: 'ADMIN', clinicId: CLINIC_A, hospitalId: HOSPITAL });
   });
 
   afterAll(async () => {
@@ -75,6 +82,7 @@ describe('Admin Portal (full stack)', () => {
     await prisma.doctor.deleteMany({ where: { clinicId: { in: [CLINIC_A, CLINIC_B] } } });
     await prisma.staff.deleteMany({ where: { clinicId: { in: [CLINIC_A, CLINIC_B] } } });
     await prisma.clinic.deleteMany({ where: { id: { in: [CLINIC_A, CLINIC_B] } } });
+    await prisma.hospital.deleteMany({ where: { id: HOSPITAL } });
   }
 
   function adminFetch(path: string, init: RequestInit = {}, token = adminAToken) {

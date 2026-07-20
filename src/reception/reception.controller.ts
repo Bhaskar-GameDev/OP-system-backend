@@ -104,6 +104,15 @@ export class ReceptionController {
     }
     return this.reception.setArrived(clinicId(req), id, body.arrived);
   }
+
+  /**
+   * POST /reception/bookings/:id/collect-payment — settle a pay-at-desk (voice)
+   * booking's payment in cash/UPI at the desk. Flips the Payment to SUCCESS.
+   */
+  @Post('bookings/:id/collect-payment')
+  collectPayment(@Req() req: AuthedRequest, @Param('id') id: string) {
+    return this.reception.collectPayment(clinicId(req), id);
+  }
 }
 
 function clinicId(req: AuthedRequest): string {

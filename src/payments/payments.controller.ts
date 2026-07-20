@@ -28,22 +28,16 @@ export class PaymentsController {
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles('PATIENT', 'STAFF', 'ADMIN')
   async initiate(@Body() body: Partial<InitiateBookingInput>) {
-    if (
-      !body.patientId ||
-      !body.doctorId ||
-      !body.sessionDate ||
-      !body.sessionType ||
-      !body.source
-    ) {
+    // Same-day model: no date / slot in the payload. The session is auto-resolved
+    // to today's next-starting, not-yet-ended session inside initiateBooking.
+    if (!body.patientId || !body.doctorId || !body.source) {
       throw new BadRequestException(
-        'patientId, doctorId, sessionDate, sessionType, source are required',
+        'patientId, doctorId, source are required',
       );
     }
     return this.payments.initiateBooking({
       patientId: body.patientId,
       doctorId: body.doctorId,
-      sessionDate: body.sessionDate,
-      sessionType: body.sessionType,
       source: body.source as BookingSource,
     });
   }
