@@ -24,6 +24,17 @@ enum StaffRole {
   ADMIN
 }
 
+// Which platform a stored push token came from.
+//
+// It matters because the token TYPE differs by platform and the FCM message
+// needs a platform-specific block to carry sound/badge on iOS. NULL means
+// "registered before this column existed", which can only be Android — iOS
+// push did not work at all before it — so null is read as ANDROID everywhere.
+enum PushPlatform {
+  ANDROID
+  IOS
+}
+
 // Where a booking originated. Source of truth for filtering/analytics —
 // NEVER derive this from the token prefix. APP and VOICE intentionally share
 // the "A" token prefix, so prefix-parsing cannot distinguish them.
@@ -79,8 +90,14 @@ model Patient {
   mobile    String   @unique
   age       Int?
   gender    Gender?
-  // FCM device token for push (captured at login/app-open). Single device, V1.
+  // FCM registration token for push (captured at login/app-open). Single
+  // device, V1. Deliberately still named fcm_token now that it is
+  // platform-aware: it is an FCM token on BOTH platforms — on iOS the app
+  // exchanges the APNs token for one via the Firebase SDK, so FCM stays the
+  // single delivery path and the name stays accurate.
   fcmToken  String?  @map("fcm_token")
+  // Platform the token above came from. Null = pre-dates this column = Android.
+  pushPlatform PushPlatform? @map("push_platform")
   createdAt DateTime @default(now()) @map("created_at")
 
   bookings Booking[]

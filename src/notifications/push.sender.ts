@@ -12,12 +12,18 @@ type FirebaseAdmin = {
   messaging(): FirebaseMessaging;
 };
 
+/** The FCM message shape we build. `apns` is only set for iOS targets. */
+export interface FcmMessage {
+  token: string;
+  notification: { title: string; body: string };
+  data: Record<string, string>;
+  apns?: {
+    payload: { aps: { sound: string; badge: number } };
+  };
+}
+
 type FirebaseMessaging = {
-  send(msg: {
-    token: string;
-    notification: { title: string; body: string };
-    data: Record<string, string>;
-  }): Promise<string>;
+  send(msg: FcmMessage): Promise<string>;
 };
 
 /** A push notification payload destined for one device token. */
@@ -28,11 +34,54 @@ export interface PushMessage {
 }
 
 /**
+ * Platform a device token belongs to. Null means the token was registered
+ * before the platform column existed, which can only be Android.
+ */
+export type DevicePlatform = 'ANDROID' | 'IOS' | null;
+
+/**
+ * Build the FCM message for one device.
+ *
+ * FCM delivers to iOS via APNs on our behalf, but only if the message carries an
+ * `apns` block — without it the notification still arrives, silently and with no
+ * badge, which reads as "push is broken" to a patient waiting on their token.
+ * Android needs no equivalent: its sound/priority come from the notification
+ * channel the app registers, not from the message.
+ *
+ * Exported so the platform branch is unit-testable without a live FCM client.
+ */
+export function buildFcmMessage(
+  deviceToken: string,
+  message: PushMessage,
+  platform: DevicePlatform,
+): FcmMessage {
+  const base: FcmMessage = {
+    token: deviceToken,
+    notification: { title: message.title, body: message.body },
+    data: message.data,
+  };
+  if (platform !== 'IOS') return base;
+
+  return {
+    ...base,
+    apns: {
+      // Static badge of 1: this is a "you have something waiting" nudge, not an
+      // unread counter — the backend tracks no per-patient unread state.
+      payload: { aps: { sound: 'default', badge: 1 } },
+    },
+  };
+}
+
+/**
  * Sends a push to one FCM device token. Swap the impl (real FCM vs test fake)
  * via the PUSH_SENDER token — same seam pattern as SMS_SENDER / RAZORPAY_GATEWAY.
  */
 export interface PushSender {
-  send(deviceToken: string, message: PushMessage): Promise<void>;
+  send(
+    deviceToken: string,
+    message: PushMessage,
+    platform?: DevicePlatform,
+  ): Promise<void>;
 }
 
 /**
@@ -48,7 +97,11 @@ export class FcmPushSender implements PushSender {
 
   constructor(private readonly config: ConfigService) {}
 
-  async send(deviceToken: string, message: PushMessage): Promise<void> {
+  async send(
+    deviceToken: string,
+    message: PushMessage,
+    platform: DevicePlatform = null,
+  ): Promise<void> {
     const messaging = await this.getMessaging();
     if (!messaging) {
       this.logger.warn(
@@ -58,11 +111,7 @@ export class FcmPushSender implements PushSender {
     }
 
     try {
-      await messaging.send({
-        token: deviceToken,
-        notification: { title: message.title, body: message.body },
-        data: message.data,
-      });
+      await messaging.send(buildFcmMessage(deviceToken, message, platform));
     } catch (err) {
       this.logger.error(
         `FCM send failed for ${deviceToken.slice(0, 8)}…: ${(err as Error).message}`,

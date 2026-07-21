@@ -404,6 +404,24 @@ async function seedBookings(): Promise<void> {
     },
   });
 
+  // Drop any history rows for the demo bookings we are about to re-create.
+  //
+  // The archival sweep MOVES a settled booking: it appends to the append-only
+  // booking_history and deletes the live row. Re-seeding then resurrects that
+  // same stable id in `bookings`, so the next sweep tries to archive it a second
+  // time and dies on booking_history's unique booking_id — wedging the archival
+  // cron for good in any environment that re-seeds (the demo container re-seeds
+  // on every start).
+  //
+  // Cleaning the history side here is what keeps the seed's contract — "run this
+  // and the database is in a known good demo state" — true across the archival
+  // boundary. Scoped to the demo ids on purpose: real archived history in a dev
+  // database is left untouched, and archival's own no-update/no-delete invariant
+  // (HA-3) is not weakened, because this is the seed's own data, not the sweep's.
+  await prisma.bookingHistory.deleteMany({
+    where: { bookingId: { in: BOOKINGS.map((b) => b.id) } },
+  });
+
   // Live (not-completed) bookings sit in today's session; give them a createdAt
   // a little while ago so "today" is populated without inventing a consult.
   const liveCreatedAt = new Date(Date.now() - 25 * 60_000);

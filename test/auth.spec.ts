@@ -11,8 +11,12 @@ import { RedisService } from '../src/common/redis/redis.service';
 
 class CapturingSms implements SmsSender {
   last?: { mobile: string; otp: string };
+  texts: { mobile: string; message: string }[] = [];
   async sendOtp(mobile: string, otp: string): Promise<void> {
     this.last = { mobile, otp };
+  }
+  async sendText(mobile: string, message: string): Promise<void> {
+    this.texts.push({ mobile, message });
   }
 }
 

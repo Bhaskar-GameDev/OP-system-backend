@@ -17,8 +17,12 @@ import { SessionKey, TokenSource } from '../src/queue-engine/token.service';
 /** Captures the OTP so the test can complete a REAL patient login flow. */
 class CapturingSms implements SmsSender {
   last?: { mobile: string; otp: string };
+  texts: { mobile: string; message: string }[] = [];
   async sendOtp(mobile: string, otp: string): Promise<void> {
     this.last = { mobile, otp };
+  }
+  async sendText(mobile: string, message: string): Promise<void> {
+    this.texts.push({ mobile, message });
   }
 }
 

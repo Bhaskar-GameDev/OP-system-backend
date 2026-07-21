@@ -23,6 +23,11 @@ export interface VoiceDoctorAvailability {
 export interface VoiceAvailabilityResponse {
   clinicId: string;
   clinicName: string;
+  /**
+   * Clinic's public number, so the agent can hand a caller somewhere real when
+   * asked for a human. Null when the clinic has none on file.
+   */
+  clinicContactNumber: string | null;
   sessionDate: string;
   doctors: VoiceDoctorAvailability[];
 }
@@ -67,6 +72,29 @@ export interface VoiceAppointmentRecord {
 // ── /voice/appointments/cancel ──
 export interface VoiceCancelRequest {
   appointmentId: string;
+}
+
+// ── /voice/queue-status ──
+export interface VoiceQueueStatusRequest {
+  didNumber: string;
+  patientPhone: string;
+}
+/**
+ * Live position for one of the caller's own tokens. Everything here is meant to
+ * be read aloud, so it is pre-derived rather than raw: the agent should never
+ * have to compute a wait from a queue listing mid-call.
+ */
+export interface VoiceQueueStatusRecord {
+  bookingId: string;
+  tokenNumber: string;
+  doctorName: string;
+  specialization: string | null;
+  sessionType: SessionType;
+  /** People strictly ahead of this token right now. 0 = they are being seen. */
+  patientsAhead: number;
+  estimatedWaitMinutes: number;
+  /** Token at the front of that doctor's queue, or null if the queue is empty. */
+  currentlyServing: string | null;
 }
 
 // ── /voice/call-logs ──

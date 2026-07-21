@@ -12,7 +12,7 @@ import { ConfigService } from '@nestjs/config';
  * a logged-in user — it is called by the trusted voice agent process, which
  * presents a shared secret in the `x-voice-secret` header.
  *
- * Fail closed: if no `VOICE_SECRET` is configured the API is unusable (401), so
+ * Fail closed: if no `VOICE_INTERNAL_SECRET` is configured the API is unusable (401), so
  * the endpoints are never silently open. Constant-time compare avoids leaking the
  * secret via timing.
  */
@@ -21,7 +21,7 @@ export class VoiceSecretGuard implements CanActivate {
   constructor(private readonly config: ConfigService) {}
 
   canActivate(context: ExecutionContext): boolean {
-    const configured = this.config.get<string>('VOICE_SECRET');
+    const configured = this.config.get<string>('VOICE_INTERNAL_SECRET');
     if (!configured) {
       throw new UnauthorizedException('voice API not configured');
     }

@@ -1,7 +1,9 @@
 import {
   ConflictException,
   ForbiddenException,
+  Inject,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import {
@@ -14,11 +16,13 @@ import {
 import { PrismaService } from '../common/prisma/prisma.service';
 import { SessionResolverService } from '../bookings/session-resolver.service';
 import { ConsultationService } from '../queue-engine/consultation.service';
+import { EtaService } from '../queue-engine/eta.service';
 import { QueueService } from '../queue-engine/queue.service';
 import { AuditService } from '../queue-engine/audit.service';
 import { PaymentsService } from '../payments/payments.service';
 import { SessionKey, TokenSource } from '../queue-engine/token.service';
 import { SessionClaims } from '../auth/auth-token.service';
+import { SMS_SENDER, SmsSender } from '../auth/sms.sender';
 import {
   VoiceAppointmentRecord,
   VoiceAvailabilityRequest,
@@ -28,6 +32,8 @@ import {
   VoiceCallLogRequest,
   VoiceDoctorAvailability,
   VoiceLookupRequest,
+  VoiceQueueStatusRecord,
+  VoiceQueueStatusRequest,
 } from './voice.dto';
 
 // Statuses a caller can still act on over the phone (token issued, in play).
@@ -46,21 +52,27 @@ const LIVE_STATUSES: BookingStatus[] = [BookingStatus.BOOKED, BookingStatus.ACTI
  */
 @Injectable()
 export class VoiceService {
+  private readonly logger = new Logger(VoiceService.name);
+
   constructor(
+    @Inject(SMS_SENDER) private readonly sms: SmsSender,
     private readonly prisma: PrismaService,
     private readonly resolver: SessionResolverService,
     private readonly consult: ConsultationService,
     private readonly queue: QueueService,
+    private readonly eta: EtaService,
     private readonly audit: AuditService,
     private readonly payments: PaymentsService,
   ) {}
 
   /** DID -> owning clinic. Unknown number is a 404 the agent surfaces as "sorry,
    *  this number isn't set up". */
-  private async clinicForDid(didNumber: string): Promise<{ id: string; name: string }> {
+  private async clinicForDid(
+    didNumber: string,
+  ): Promise<{ id: string; name: string; contactNumber: string | null }> {
     const mapping = await this.prisma.voiceNumber.findUnique({
       where: { didNumber },
-      select: { clinic: { select: { id: true, name: true } } },
+      select: { clinic: { select: { id: true, name: true, contactNumber: true } } },
     });
     if (!mapping) throw new NotFoundException('no clinic is configured for this number');
     return mapping.clinic;
@@ -113,7 +125,13 @@ export class VoiceService {
       });
     }
 
-    return { clinicId: clinic.id, clinicName: clinic.name, sessionDate, doctors: out };
+    return {
+      clinicId: clinic.id,
+      clinicName: clinic.name,
+      clinicContactNumber: clinic.contactNumber,
+      sessionDate,
+      doctors: out,
+    };
   }
 
   // ── book ──────────────────────────────────────────────────────────────────
@@ -232,6 +250,18 @@ export class VoiceService {
       select: { id: true, tokenNumber: true, status: true },
     });
 
+    // The caller has no app, so this SMS is their ONLY durable record of the
+    // token — they otherwise have a number a synthetic voice said once, possibly
+    // in their second language. Best-effort by design: the token is already
+    // issued and enqueued, so a provider outage must not undo a real booking.
+    await this.sendBookingSms({
+      mobile: req.patientPhone,
+      tokenNumber: updated.tokenNumber ?? entry.tokenNumber,
+      doctorName: doctor.name,
+      clinicName: clinic.name,
+      session,
+    });
+
     return {
       bookingId: updated.id,
       tokenNumber: updated.tokenNumber ?? entry.tokenNumber,
@@ -275,6 +305,116 @@ export class VoiceService {
       tokenNumber: b.tokenNumber,
       status: b.status,
     }));
+  }
+
+  /**
+   * Confirmation SMS for a phone booking.
+   *
+   * Deliberately NOT NotificationsService.bookingConfirmed(): that sends a PUSH
+   * to a stored FCM token, and a voice caller is by definition someone without
+   * the app — they would receive nothing. The body is also self-contained for
+   * the same reason: no deep link, no "open the app", just the facts they need
+   * to walk into the clinic.
+   */
+  private async sendBookingSms(args: {
+    mobile: string;
+    tokenNumber: string;
+    doctorName: string;
+    clinicName: string;
+    session: SessionKey;
+  }): Promise<void> {
+    try {
+      const ahead = Math.max(0, (await this.queue.size(args.session)) - 1);
+      const doctor = await this.prisma.doctor.findUnique({
+        where: { id: args.session.doctorId },
+        select: { avgConsultMinutes: true },
+      });
+      const waitMinutes = ahead * (doctor?.avgConsultMinutes ?? 10);
+
+      const wait =
+        ahead === 0
+          ? 'You are next.'
+          : `${ahead} ahead of you, about ${waitMinutes} minutes.`;
+
+      await this.sms.sendText(
+        args.mobile,
+        `Your token is ${args.tokenNumber} for ${args.doctorName} at ${args.clinicName}. ${wait} Please pay at the reception desk on arrival.`,
+      );
+    } catch (err) {
+      this.logger.error(
+        `booking SMS failed for ${args.tokenNumber}: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  // ── queue status ──────────────────────────────────────────────────────────
+  /**
+   * Live queue position for every token the caller currently holds at the dialed
+   * clinic — "what's my number, how many ahead, how long".
+   *
+   * Returns an EMPTY ARRAY when the caller has no live booking. Deliberately not
+   * a 404: the agent has to tell "you have no booking" apart from "the backend
+   * failed", and those need different things said to the caller.
+   */
+  async queueStatus(req: VoiceQueueStatusRequest): Promise<VoiceQueueStatusRecord[]> {
+    const clinic = await this.clinicForDid(req.didNumber);
+    const patient = await this.prisma.patient.findUnique({
+      where: { mobile: req.patientPhone },
+      select: { id: true },
+    });
+    if (!patient) return [];
+
+    const bookings = await this.prisma.booking.findMany({
+      where: {
+        patientId: patient.id,
+        status: { in: LIVE_STATUSES },
+        tokenNumber: { not: null },
+        // Clinic scope: a token held at another clinic is not this caller's
+        // business on this line, even though it is the same patient record.
+        doctor: { clinicId: clinic.id },
+      },
+      select: {
+        id: true,
+        tokenNumber: true,
+        doctorId: true,
+        sessionDate: true,
+        sessionType: true,
+        doctor: { select: { name: true, specialization: true } },
+      },
+      orderBy: { sessionDate: 'asc' },
+    });
+
+    const out: VoiceQueueStatusRecord[] = [];
+    for (const b of bookings) {
+      const token = b.tokenNumber;
+      if (!token) continue;
+
+      const session: SessionKey = {
+        doctorId: b.doctorId,
+        sessionDate: ymd(b.sessionDate),
+        sessionType: b.sessionType,
+      };
+      const [eta, serving] = await Promise.all([
+        this.eta.etaFor(token, session),
+        this.queue.frontToken(session),
+      ]);
+      // No ETA means the token has left the live queue (completed / no-show /
+      // session cleared) even though the row still reads BOOKED — skip it rather
+      // than read out a stale position.
+      if (!eta) continue;
+
+      out.push({
+        bookingId: b.id,
+        tokenNumber: token,
+        doctorName: b.doctor.name,
+        specialization: b.doctor.specialization,
+        sessionType: b.sessionType,
+        patientsAhead: eta.patientsAhead,
+        estimatedWaitMinutes: eta.etaMinutes,
+        currentlyServing: serving,
+      });
+    }
+    return out;
   }
 
   // ── cancel ────────────────────────────────────────────────────────────────

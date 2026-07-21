@@ -17,6 +17,7 @@ import { DoctorModule } from './doctor/doctor.module';
 import { ProfileModule } from './profile/profile.module';
 import { IntegrationsModule } from './integrations/integrations.module';
 import { VoiceModule } from './voice/voice.module';
+import { DisplayModule } from './display/display.module';
 
 @Module({
   imports: [
@@ -38,6 +39,7 @@ import { VoiceModule } from './voice/voice.module';
     ProfileModule,
     IntegrationsModule,
     VoiceModule,
+    DisplayModule,
   ],
 })
 export class AppModule {}

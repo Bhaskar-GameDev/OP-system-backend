@@ -1,0 +1,650 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Queue Board</title>
+    <style>
+      /*
+       * Waiting-room board. Sized for a 1080p landscape TV read from 3–5 metres,
+       * and for a cheap wall-mounted Android tablet in landscape. Dark by design:
+       * easier on the eye under bright clinic lighting, and it spares cheaper
+       * panels the burn-in a mostly-white screen would cause over a whole day.
+       *
+       * Nothing scrolls. Everything scales off --rows so a board of one doctor
+       * and a board of six both fill the screen without overflowing it.
+       */
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+
+      :root {
+        --bg: #0a0e17;
+        --card: #141a28;
+        --card-edge: #232c42;
+        --text: #f2f5fb;
+        --muted: #7f8aa3;
+        --accent: #35d07f;
+        --accent-dim: #1c7a4c;
+        --idle: #4a5570;
+        --rows: 1;
+        --cols: 1;
+      }
+
+      html,
+      body {
+        height: 100%;
+        overflow: hidden;
+      }
+
+      body {
+        background: var(--bg);
+        color: var(--text);
+        font-family: "Segoe UI", Roboto, system-ui, -apple-system, sans-serif;
+        font-variant-numeric: tabular-nums;
+        display: flex;
+        flex-direction: column;
+        padding: 1.6vmin 2vmin;
+        gap: 1.4vmin;
+        /* keeps the board clear of a tablet's rounded corners / notch */
+        padding-top: max(1.6vmin, env(safe-area-inset-top));
+      }
+
+      /* ── header ─────────────────────────────────────────── */
+      header {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 2vmin;
+        flex: none;
+      }
+
+      #clinic {
+        font-size: 3.4vmin;
+        font-weight: 700;
+        letter-spacing: 0.02em;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .header-right {
+        display: flex;
+        align-items: baseline;
+        gap: 2vmin;
+        flex: none;
+      }
+
+      #date,
+      #clock {
+        font-size: 2.4vmin;
+        color: var(--muted);
+        font-weight: 500;
+      }
+
+      #clock {
+        color: var(--text);
+      }
+
+      /* ── board ──────────────────────────────────────────── */
+      main {
+        flex: 1;
+        min-height: 0;
+      }
+
+      #grid {
+        display: grid;
+        grid-template-columns: repeat(var(--cols), 1fr);
+        grid-template-rows: repeat(var(--rows), 1fr);
+        gap: 1.4vmin;
+        height: 100%;
+      }
+
+      .card {
+        background: var(--card);
+        border: 0.15vmin solid var(--card-edge);
+        border-radius: 1.4vmin;
+        padding: 1.8vmin 2vmin;
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+        min-height: 0;
+        overflow: hidden;
+      }
+
+      .doctor {
+        font-size: calc(4.6vh / var(--rows) + 0.9vmin);
+        font-weight: 700;
+        line-height: 1.15;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .specialty {
+        font-size: calc(2.8vh / var(--rows) + 0.7vmin);
+        color: var(--muted);
+        font-weight: 500;
+        margin-top: 0.3vmin;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      /* NOW SERVING — the one thing that must read from across the room. */
+      .serving {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        min-height: 0;
+      }
+
+      .serving-label {
+        font-size: calc(2.4vh / var(--rows) + 0.6vmin);
+        letter-spacing: 0.22em;
+        color: var(--muted);
+        font-weight: 700;
+        text-transform: uppercase;
+      }
+
+      .token {
+        font-size: calc(30vh / var(--rows));
+        font-weight: 800;
+        line-height: 1;
+        color: var(--accent);
+        letter-spacing: -0.01em;
+      }
+
+      .token.idle {
+        font-size: calc(7vh / var(--rows) + 0.8vmin);
+        color: var(--idle);
+        font-weight: 600;
+        text-align: center;
+        letter-spacing: 0;
+      }
+
+      /* ── card footer: recent tokens + waiting ────────────── */
+      .footer {
+        display: flex;
+        align-items: flex-end;
+        justify-content: space-between;
+        gap: 1.5vmin;
+        flex: none;
+        border-top: 0.15vmin solid var(--card-edge);
+        padding-top: 1.2vmin;
+      }
+
+      .footer-label {
+        font-size: calc(2vh / var(--rows) + 0.55vmin);
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.14em;
+        font-weight: 700;
+        margin-bottom: 0.4vmin;
+      }
+
+      .recent {
+        display: flex;
+        gap: 0.8vmin;
+        flex-wrap: nowrap;
+        overflow: hidden;
+      }
+
+      .recent span {
+        font-size: calc(3vh / var(--rows) + 0.6vmin);
+        font-weight: 700;
+        color: var(--muted);
+        background: #1c2436;
+        border-radius: 0.7vmin;
+        padding: 0.35vmin 1vmin;
+      }
+
+      .recent .none {
+        background: none;
+        padding: 0;
+        font-weight: 500;
+      }
+
+      .waiting {
+        text-align: right;
+        flex: none;
+      }
+
+      .waiting-count {
+        font-size: calc(5.5vh / var(--rows) + 0.6vmin);
+        font-weight: 800;
+        line-height: 1;
+      }
+
+      .eta {
+        font-size: calc(2vh / var(--rows) + 0.5vmin);
+        color: var(--muted);
+        font-weight: 600;
+        margin-top: 0.4vmin;
+        white-space: nowrap;
+      }
+
+      /* Called-token flash: a brief lift + green wash, enough to pull an eye up
+         from a phone without turning the room into a light show. */
+      @keyframes flash {
+        0% {
+          background: var(--accent-dim);
+          border-color: var(--accent);
+          transform: scale(1);
+        }
+        18% {
+          transform: scale(1.035);
+        }
+        100% {
+          background: var(--card);
+          border-color: var(--card-edge);
+          transform: scale(1);
+        }
+      }
+
+      .card.flash {
+        animation: flash 2.2s ease-out;
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .card.flash {
+          animation-name: none;
+        }
+      }
+
+      /* ── empty state ────────────────────────────────────── */
+      #empty {
+        height: 100%;
+        display: none;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 1.5vmin;
+        text-align: center;
+      }
+
+      #empty.on {
+        display: flex;
+      }
+
+      #empty .mark {
+        font-size: 9vmin;
+      }
+
+      #empty .msg {
+        font-size: 4.4vmin;
+        font-weight: 700;
+      }
+
+      #empty .sub {
+        font-size: 2.4vmin;
+        color: var(--muted);
+        font-weight: 500;
+      }
+
+      /* ── status pills ───────────────────────────────────── */
+      #status {
+        position: fixed;
+        right: 2vmin;
+        bottom: 2vmin;
+        display: flex;
+        align-items: center;
+        gap: 1vmin;
+        background: #3a2a12;
+        color: #f5c451;
+        border: 0.15vmin solid #6b4c17;
+        border-radius: 5vmin;
+        padding: 0.9vmin 1.8vmin;
+        font-size: 1.9vmin;
+        font-weight: 600;
+        opacity: 0;
+        transition: opacity 0.3s;
+        pointer-events: none;
+      }
+
+      #status.on {
+        opacity: 1;
+      }
+
+      #status .dot {
+        width: 1.1vmin;
+        height: 1.1vmin;
+        border-radius: 50%;
+        background: currentColor;
+        animation: pulse 1.2s ease-in-out infinite;
+      }
+
+      @keyframes pulse {
+        50% {
+          opacity: 0.25;
+        }
+      }
+
+      #pager {
+        position: fixed;
+        left: 50%;
+        bottom: 1.6vmin;
+        transform: translateX(-50%);
+        display: none;
+        gap: 1vmin;
+      }
+
+      #pager.on {
+        display: flex;
+      }
+
+      #pager i {
+        width: 1.3vmin;
+        height: 1.3vmin;
+        border-radius: 50%;
+        background: var(--card-edge);
+      }
+
+      #pager i.now {
+        background: var(--accent);
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div id="clinic">Loading…</div>
+      <div class="header-right">
+        <div id="date"></div>
+        <div id="clock"></div>
+      </div>
+    </header>
+
+    <main>
+      <div id="grid"></div>
+      <div id="empty">
+        <div class="mark">🌙</div>
+        <div class="msg">No sessions scheduled today</div>
+        <div class="sub">Please check with reception</div>
+      </div>
+    </main>
+
+    <div id="status"><span class="dot"></span><span id="status-text">Reconnecting…</span></div>
+    <div id="pager"></div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+      (function () {
+        "use strict";
+
+        /* Clinic id is the last segment of this page's own URL, so the same
+           static file serves every clinic. */
+        var CLINIC_ID = decodeURIComponent(
+          window.location.pathname.replace(/\/+$/, "").split("/").pop() || ""
+        );
+
+        /* Cards per page. Six (3x2) is the point where a token is still legible
+           from the back of a waiting room on a 1080p panel; past that the board
+           pages instead of shrinking. */
+        var PER_PAGE = 6;
+        var PAGE_MS = 10000;
+        /* Structural refetch. Socket deltas cover queue movement, but a doctor
+           whose session starts mid-afternoon produces no queue event at all, so
+           the board re-reads its own shape on a slow poll. */
+        var POLL_MS = 60000;
+
+        var grid = document.getElementById("grid");
+        var emptyEl = document.getElementById("empty");
+        var pager = document.getElementById("pager");
+        var statusEl = document.getElementById("status");
+        var statusText = document.getElementById("status-text");
+
+        var board = null;
+        /* doctorId -> last rendered nowServing, so a changed token can be
+           flashed. Kept outside `board` because it must survive a full replace. */
+        var lastServing = {};
+        var page = 0;
+
+        /* ── rendering ─────────────────────────────────────── */
+
+        function pageCount() {
+          if (!board || !board.doctors.length) return 1;
+          return Math.ceil(board.doctors.length / PER_PAGE);
+        }
+
+        /* Column/row split per card count. Chosen by hand rather than by
+           auto-fit: the board must fill the screen exactly, and auto-fit leaves
+           a ragged last row that wastes the height the tokens need. */
+        function layoutFor(n) {
+          if (n <= 1) return [1, 1];
+          if (n === 2) return [2, 1];
+          if (n === 3) return [3, 1];
+          if (n === 4) return [2, 2];
+          return [3, 2];
+        }
+
+        function render() {
+          if (!board) return;
+
+          document.getElementById("clinic").textContent = board.clinicName;
+          document.getElementById("date").textContent = formatDate(board.date);
+
+          var all = board.doctors;
+          var showEmpty = all.length === 0;
+          emptyEl.classList.toggle("on", showEmpty);
+          grid.style.display = showEmpty ? "none" : "";
+          if (showEmpty) {
+            pager.classList.remove("on");
+            grid.replaceChildren();
+            return;
+          }
+
+          var pages = pageCount();
+          if (page >= pages) page = 0;
+          var slice = all.slice(page * PER_PAGE, page * PER_PAGE + PER_PAGE);
+
+          var layout = layoutFor(slice.length);
+          document.documentElement.style.setProperty("--cols", layout[0]);
+          document.documentElement.style.setProperty("--rows", layout[1]);
+
+          grid.replaceChildren.apply(
+            grid,
+            slice.map(function (d) {
+              return cardFor(d);
+            })
+          );
+
+          renderPager(pages);
+        }
+
+        function renderPager(pages) {
+          pager.classList.toggle("on", pages > 1);
+          if (pages <= 1) {
+            pager.replaceChildren();
+            return;
+          }
+          var dots = [];
+          for (var i = 0; i < pages; i++) {
+            var dot = document.createElement("i");
+            if (i === page) dot.className = "now";
+            dots.push(dot);
+          }
+          pager.replaceChildren.apply(pager, dots);
+        }
+
+        function cardFor(d) {
+          var card = el("div", "card");
+
+          card.appendChild(el("div", "doctor", d.name));
+          if (d.specialization) {
+            card.appendChild(el("div", "specialty", d.specialization));
+          }
+
+          var serving = el("div", "serving");
+          if (d.nowServing) {
+            serving.appendChild(el("div", "serving-label", "Now Serving"));
+            serving.appendChild(el("div", "token", d.nowServing));
+          } else {
+            /* Idle doctors keep their card: they are still open for walk-ins,
+               and a missing card reads as "gone home". */
+            serving.appendChild(el("div", "token idle", "No patients in queue"));
+          }
+          card.appendChild(serving);
+
+          card.appendChild(footerFor(d));
+
+          /* Flash only on a real change, and never on the first paint — every
+             card would fire at once when the TV boots. */
+          var seen = Object.prototype.hasOwnProperty.call(lastServing, d.doctorId);
+          if (seen && lastServing[d.doctorId] !== d.nowServing && d.nowServing) {
+            card.classList.add("flash");
+          }
+          lastServing[d.doctorId] = d.nowServing;
+
+          return card;
+        }
+
+        function footerFor(d) {
+          var footer = el("div", "footer");
+
+          var recentWrap = el("div");
+          recentWrap.appendChild(el("div", "footer-label", "Recently seen"));
+          var recent = el("div", "recent");
+          if (d.recentTokens.length) {
+            d.recentTokens.forEach(function (t) {
+              recent.appendChild(el("span", null, t));
+            });
+          } else {
+            recent.appendChild(el("span", "none", "—"));
+          }
+          recentWrap.appendChild(recent);
+          footer.appendChild(recentWrap);
+
+          var waiting = el("div", "waiting");
+          waiting.appendChild(el("div", "footer-label", "Waiting"));
+          waiting.appendChild(el("div", "waiting-count", String(d.waitingCount)));
+          if (d.nextEtaMinutes !== null && d.nextEtaMinutes !== undefined) {
+            waiting.appendChild(el("div", "eta", "~" + d.nextEtaMinutes + " min wait"));
+          }
+          footer.appendChild(waiting);
+
+          return footer;
+        }
+
+        function el(tag, cls, text) {
+          var node = document.createElement(tag);
+          if (cls) node.className = cls;
+          if (text !== undefined) node.textContent = text;
+          return node;
+        }
+
+        function formatDate(ymd) {
+          var parts = String(ymd).split("-");
+          var d = new Date(+parts[0], +parts[1] - 1, +parts[2]);
+          if (isNaN(d.getTime())) return "";
+          return d.toLocaleDateString(undefined, {
+            weekday: "long",
+            day: "numeric",
+            month: "long",
+          });
+        }
+
+        /* ── clock ─────────────────────────────────────────── */
+        function tickClock() {
+          document.getElementById("clock").textContent = new Date().toLocaleTimeString(
+            undefined,
+            { hour: "2-digit", minute: "2-digit" }
+          );
+        }
+        tickClock();
+        setInterval(tickClock, 10000);
+
+        /* ── page rotation ─────────────────────────────────── */
+        setInterval(function () {
+          var pages = pageCount();
+          if (pages <= 1) return;
+          page = (page + 1) % pages;
+          render();
+        }, PAGE_MS);
+
+        /* ── status pill ───────────────────────────────────── */
+        function status(msg) {
+          if (msg) {
+            statusText.textContent = msg;
+            statusEl.classList.add("on");
+          } else {
+            statusEl.classList.remove("on");
+          }
+        }
+
+        /* ── data ──────────────────────────────────────────── */
+        function refetch() {
+          return fetch("/display/" + encodeURIComponent(CLINIC_ID) + "/state", {
+            cache: "no-store",
+          })
+            .then(function (res) {
+              if (!res.ok) throw new Error("state " + res.status);
+              return res.json();
+            })
+            .then(function (next) {
+              board = next;
+              render();
+            })
+            .catch(function () {
+              /* Keep the last-known board on screen — a stale token number is
+                 far more useful to the room than an error page. */
+              status("Reconnecting…");
+            });
+        }
+
+        refetch();
+        setInterval(refetch, POLL_MS);
+
+        /* ── live feed ─────────────────────────────────────── */
+        var socket = io({
+          query: { display: "true", clinicId: CLINIC_ID },
+          transports: ["websocket", "polling"],
+          reconnectionDelayMax: 10000,
+        });
+
+        socket.on("connect", function () {
+          status(null);
+        });
+
+        socket.on("display:snapshot", function (next) {
+          board = next;
+          render();
+        });
+
+        socket.on("display:update", function (msg) {
+          if (!board || !msg || !msg.doctor) return;
+          if (msg.clinicId !== board.clinicId) return;
+
+          var i = board.doctors.findIndex(function (d) {
+            return d.doctorId === msg.doctor.doctorId;
+          });
+          if (i === -1) {
+            /* A doctor who was not on the board just took a patient — pull the
+               whole shape rather than guessing where they sort. */
+            refetch();
+            return;
+          }
+          board.doctors[i] = msg.doctor;
+          render();
+        });
+
+        socket.on("disconnect", function () {
+          status("Reconnecting…");
+        });
+
+        socket.on("connect_error", function () {
+          status("Reconnecting…");
+        });
+
+        socket.on("error", function (e) {
+          status(e && e.message ? e.message : "Connection error");
+        });
+      })();
+    </script>
+  </body>
+</html>

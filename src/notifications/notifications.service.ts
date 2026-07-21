@@ -6,6 +6,7 @@ import {
   OnModuleInit,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { PushPlatform } from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { RedisService } from '../common/redis/redis.service';
 import { QueueService } from '../queue-engine/queue.service';
@@ -31,6 +32,23 @@ const STALE_TOKEN_CODES = new Set([
   'messaging/invalid-registration-token',
   'messaging/invalid-argument',
 ]);
+
+/**
+ * NOTE: these are FCM-level codes, returned the same way whether FCM ended up
+ * delivering via APNs (iOS) or directly (Android), so the set covers both.
+ *
+ * `messaging/third-party-auth-error` is deliberately NOT here. FCM returns it
+ * for an iOS token when the APNs key is missing or wrong in the Firebase
+ * project — a server misconfiguration, not a dead device. Clearing the token on
+ * it would make every iOS device re-register in a loop while hiding the actual
+ * cause.
+ */
+
+/** Where to push for one patient: the token, plus the platform that issued it. */
+type PatientDevice = {
+  fcmToken: string | null;
+  pushPlatform: PushPlatform | null;
+};
 
 /**
  * Patient push notifications. A SECOND, independent consumer of the Queue
@@ -95,7 +113,7 @@ export class NotificationsService implements OnModuleInit, OnModuleDestroy {
   async bookingConfirmed(bookingId: string): Promise<void> {
     const booking = await this.prisma.booking.findUnique({
       where: { id: bookingId },
-      include: { patient: { select: { fcmToken: true } } },
+      include: { patient: { select: { fcmToken: true, pushPlatform: true } } },
     });
     if (!booking?.tokenNumber) return;
     const session: SessionKey = {
@@ -107,7 +125,7 @@ export class NotificationsService implements OnModuleInit, OnModuleDestroy {
       NotificationType.BOOKING_CONFIRMED,
       session,
       bookingId, // member: booking id (token is enough too, but confirm is per-booking)
-      booking.patient?.fcmToken ?? null,
+      booking.patient ?? null,
       booking.patientId,
       booking.tokenNumber,
       {
@@ -135,7 +153,7 @@ export class NotificationsService implements OnModuleInit, OnModuleDestroy {
   async paymentFailed(bookingId: string): Promise<void> {
     const booking = await this.prisma.booking.findUnique({
       where: { id: bookingId },
-      include: { patient: { select: { fcmToken: true } } },
+      include: { patient: { select: { fcmToken: true, pushPlatform: true } } },
     });
     if (!booking) return;
     const session: SessionKey = {
@@ -147,7 +165,7 @@ export class NotificationsService implements OnModuleInit, OnModuleDestroy {
       NotificationType.PAYMENT_FAILED,
       session,
       bookingId,
-      booking.patient?.fcmToken ?? null,
+      booking.patient ?? null,
       booking.patientId,
       bookingId,
       {
@@ -172,7 +190,7 @@ export class NotificationsService implements OnModuleInit, OnModuleDestroy {
   async bookingCancelled(bookingId: string, refundStatus: string | null): Promise<void> {
     const booking = await this.prisma.booking.findUnique({
       where: { id: bookingId },
-      include: { patient: { select: { fcmToken: true } } },
+      include: { patient: { select: { fcmToken: true, pushPlatform: true } } },
     });
     if (!booking) return;
     const session: SessionKey = {
@@ -192,7 +210,7 @@ export class NotificationsService implements OnModuleInit, OnModuleDestroy {
       NotificationType.BOOKING_CANCELLED,
       session,
       bookingId,
-      booking.patient?.fcmToken ?? null,
+      booking.patient ?? null,
       booking.patientId,
       booking.tokenNumber ?? bookingId,
       {
@@ -241,9 +259,9 @@ export class NotificationsService implements OnModuleInit, OnModuleDestroy {
 
     const booking = await this.prisma.booking.findUnique({
       where: { id: bookingId },
-      include: { patient: { select: { fcmToken: true } } },
+      include: { patient: { select: { fcmToken: true, pushPlatform: true } } },
     });
-    const fcm = booking?.patient?.fcmToken ?? null;
+    const device = booking?.patient ?? null;
 
     const message: PushMessage =
       type === NotificationType.ARRIVAL_REMINDER
@@ -274,7 +292,7 @@ export class NotificationsService implements OnModuleInit, OnModuleDestroy {
             },
           };
 
-    await this.deliverOnce(type, session, token, fcm, booking?.patientId ?? null, token, message);
+    await this.deliverOnce(type, session, token, device, booking?.patientId ?? null, token, message);
   }
 
   /**
@@ -287,7 +305,7 @@ export class NotificationsService implements OnModuleInit, OnModuleDestroy {
     type: NotificationType,
     session: SessionKey,
     member: string,
-    deviceToken: string | null,
+    device: PatientDevice | null,
     patientId: string | null,
     logToken: string,
     message: PushMessage,
@@ -296,6 +314,7 @@ export class NotificationsService implements OnModuleInit, OnModuleDestroy {
     const added = await this.redisService.redis.sadd(key, member);
     if (added !== 1) return; // already notified -> idempotent no-op
 
+    const deviceToken = device?.fcmToken ?? null;
     if (!deviceToken) {
       // no device registered yet — un-gate so it can fire after registration
       await this.redisService.redis.srem(key, member);
@@ -308,7 +327,7 @@ export class NotificationsService implements OnModuleInit, OnModuleDestroy {
     // path runs off a committed queue mutation. A stale/invalid device token is
     // self-healed by clearing it so future sends stop failing.
     try {
-      await this.push.send(deviceToken, message);
+      await this.push.send(deviceToken, message, device?.pushPlatform ?? null);
     } catch (err) {
       const code = (err as { code?: string }).code ?? '';
       this.logger.error(

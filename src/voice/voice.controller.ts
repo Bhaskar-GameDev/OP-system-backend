@@ -7,6 +7,7 @@ import {
   VoiceCallLogRequest,
   VoiceCancelRequest,
   VoiceLookupRequest,
+  VoiceQueueStatusRequest,
 } from './voice.dto';
 
 /**
@@ -45,6 +46,20 @@ export class VoiceController {
   cancel(@Body() body: VoiceCancelRequest) {
     if (!body?.appointmentId) throw new BadRequestException('appointmentId is required');
     return this.voice.cancel(body.appointmentId);
+  }
+
+  /**
+   * Live position for the caller's own tokens. POST like the rest of this API
+   * (it carries a phone number, which has no business in a query string or an
+   * access log). An empty array means "no live booking" — never a 404, so the
+   * agent can say the right thing.
+   */
+  @Post('queue-status')
+  queueStatus(@Body() body: VoiceQueueStatusRequest) {
+    if (!body?.didNumber || !body?.patientPhone) {
+      throw new BadRequestException('didNumber and patientPhone are required');
+    }
+    return this.voice.queueStatus(body);
   }
 
   @Post('call-logs')

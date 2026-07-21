@@ -1,5 +1,5 @@
 // Voice secret MUST be set before the app (ConfigModule) boots.
-process.env.VOICE_SECRET = 'test-voice-secret';
+process.env.VOICE_INTERNAL_SECRET = 'test-voice-secret';
 
 import { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
