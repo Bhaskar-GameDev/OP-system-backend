@@ -4,6 +4,17 @@ import { ScheduleModule } from '@nestjs/schedule';
 import { RedisModule } from './common/redis/redis.module';
 import { PrismaModule } from './common/prisma/prisma.module';
 import { TenantModule } from './common/tenant/tenant.module';
+import { EventStoreModule } from './event-store/event-store.module';
+import { StateMachineModule } from './state-machine/state-machine.module';
+import { EncountersModule } from './encounters/encounters.module';
+import { TokensModule } from './tokens/tokens.module';
+import { CheckInModule } from './check-in/checkin.module';
+import { OpQueueModule } from './queue/op-queue.module';
+import { ConsultationModule } from './consultation/consultation.module';
+import { OverrideModule } from './override/override.module';
+import { ReadSideModule } from './read-side/read-side.module';
+import { ConfigEngineModule } from './config-engine/config-engine.module';
+import { MigrationModule } from './migration/migration.module';
 import { QueueEngineModule } from './queue-engine/queue-engine.module';
 import { AuthModule } from './auth/auth.module';
 import { BookingsModule } from './bookings/bookings.module';
@@ -24,6 +35,17 @@ import { DisplayModule } from './display/display.module';
     ConfigModule.forRoot({ isGlobal: true }),
     ScheduleModule.forRoot(),
     PrismaModule,
+    EventStoreModule,
+    StateMachineModule,
+    ConfigEngineModule,
+    EncountersModule,
+    TokensModule,
+    CheckInModule,
+    OpQueueModule,
+    ConsultationModule,
+    OverrideModule,
+    ReadSideModule,
+    MigrationModule,
     TenantModule,
     RedisModule,
     QueueEngineModule,

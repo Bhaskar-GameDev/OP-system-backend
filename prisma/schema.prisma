@@ -391,3 +391,405 @@ model AnalyticsDaily {
   @@index([clinicId])
   @@map("analytics_daily")
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+//  TOKEN-BASED OPD ENGINE (ARCHITECTURE.md)
+//
+//  New domain, added ADDITIVELY so the legacy `Booking` god-row keeps working
+//  through the migration window (ARCHITECTURE.md §Appendix A, Phase 15).
+//  Aggregates link by LOGICAL id (scalar), not hard Prisma FKs — the same
+//  pattern the codebase already uses for ConsultationNote/BookingHistory. This
+//  keeps aggregate boundaries clean (event-sourced) and the migration purely
+//  additive: NO existing model is touched.
+// ══════════════════════════════════════════════════════════════════════════
+
+// ─── OPD enums ────────────────────────────────────────────
+
+// How an Encounter was created. ANALYTICS/AUDIT ONLY — the queue engine must
+// NEVER branch on this (ARCHITECTURE.md §4, §5.1).
+enum RegistrationSource {
+  APP
+  VOICE_AGENT
+  RECEPTION
+}
+
+// Why the patient is consulting — a registration attribute, NOT a schedule slot.
+enum RegistrationReason {
+  NEW
+  FOLLOW_UP
+  REVIEW
+  CORPORATE
+  STAFF
+  REFERRED
+}
+
+// Encounter state machine (ARCHITECTURE.md §6.1). Transitions are validated by
+// the metadata-driven state machine (Phase 12), never by scattered logic.
+enum EncounterStatus {
+  REGISTERED // intent recorded; NO token, NOT in any queue
+  ARRIVED // physically present, pre check-in
+  CHECKED_IN // presence confirmed — eligible for a token
+  TOKEN_ISSUED // token allocated
+  WAITING // in the doctor queue
+  CALLED // doctor called this token
+  IN_CONSULTATION // being seen
+  PAUSED // consultation paused (break / emergency interrupt)
+  SKIPPED // skipped, re-queued per skip rule
+  RECALLED // recalled after skip/no-show
+  NO_SHOW // did not present when called
+  COMPLETED // consultation done
+  TRANSFERRED // moved to another doctor's queue
+  CANCELLED // cancelled before consultation
+}
+
+enum CheckInMethod {
+  DESK
+  APP_GEOFENCE
+  KIOSK
+  AUTO // reception combined register+check-in
+}
+
+enum QueueEntryState {
+  WAITING
+  CALLED
+  SKIPPED
+  RECALLED
+  IN_CONSULT
+  REMOVED
+}
+
+enum ConsultationState {
+  PENDING
+  ACTIVE
+  PAUSED
+  COMPLETED
+  TRANSFERRED
+}
+
+enum OpSessionState {
+  SCHEDULED
+  OPEN
+  PAUSED
+  CLOSED
+}
+
+// Configurable token numbering reset (ARCHITECTURE.md §5.2). Never hardcoded.
+enum TokenResetPolicy {
+  PER_SESSION
+  DAILY
+  WEEKLY
+  NEVER
+}
+
+// Serving discipline across token categories (ARCHITECTURE.md §5.3, §6).
+enum QueuePolicyMode {
+  SHARED_FIFO // one line, first-come
+  INDEPENDENT // separate lines, caller picks category
+  RATIO // interleave categories by configured weights
+  MANUAL_SWITCH // doctor toggles the active category
+}
+
+// Doctor Override reason (ARCHITECTURE.md §7). First-class, audited.
+enum OverrideReason {
+  VIP
+  MANAGEMENT
+  STAFF
+  RELATIVE
+  KNOWN_PATIENT
+  OTHER
+}
+
+// Payment mode — DECOUPLED from token issuance (ARCHITECTURE.md §3.2, §5.1).
+enum OpPaymentMode {
+  ONLINE
+  CASH
+  UPI_DESK
+  CORPORATE_BILL
+  WAIVED
+}
+
+// ─── OPD aggregates ───────────────────────────────────────
+
+// The stable spine of one OPD visit intent (ARCHITECTURE.md §3). Survives token
+// reissue, transfer, re-queue. serviceDate is a DAY, never a time slot.
+model Encounter {
+  id                 String             @id @default(uuid())
+  patientId          String             @map("patient_id")
+  hospitalId         String             @map("hospital_id")
+  clinicId           String             @map("clinic_id")
+  doctorId           String             @map("doctor_id")
+  departmentId       String?            @map("department_id")
+  serviceDate        DateTime           @map("service_date") @db.Date
+  registrationReason RegistrationReason @default(NEW) @map("registration_reason")
+  opCategoryId       String             @map("op_category_id") // -> TokenSeries
+  status             EncounterStatus    @default(REGISTERED)
+
+  // Doctor Override (ARCHITECTURE.md §7) — flagged on the encounter, never a fake token.
+  override       Boolean         @default(false)
+  overrideReason OverrideReason? @map("override_reason")
+
+  // Legacy bridge: set during migration so read models can reconcile old ↔ new.
+  legacyBookingId String? @unique @map("legacy_booking_id")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([doctorId, serviceDate])
+  @@index([patientId])
+  @@index([clinicId, serviceDate])
+  @@index([status])
+  @@map("encounters")
+}
+
+// The act of intending, per channel. source is ANALYTICS-ONLY (never read by
+// the queue). channelMeta carries {callSid, deviceId, deskId, language, …}.
+model Registration {
+  id          String             @id @default(uuid())
+  encounterId String             @map("encounter_id")
+  source      RegistrationSource
+  actorId     String?            @map("actor_id") // clerk/agent/self
+  channelMeta Json?              @map("channel_meta")
+  createdAt   DateTime           @default(now()) @map("created_at")
+
+  @@unique([encounterId]) // one registration per encounter
+  @@index([source, createdAt])
+  @@map("registrations")
+}
+
+// Physical presence — the GATE to token issuance (ARCHITECTURE.md §3.1, Phase 3).
+model CheckIn {
+  id          String        @id @default(uuid())
+  encounterId String        @unique @map("encounter_id")
+  method      CheckInMethod
+  checkedInBy String?       @map("checked_in_by")
+  checkedInAt DateTime      @default(now()) @map("checked_in_at")
+
+  @@map("check_ins")
+}
+
+// A waiting number in a category. Issued ONLY after check-in. displayNumber is
+// rendered from the TokenSeries config — prefixes are NEVER hardcoded.
+model Token {
+  id            String    @id @default(uuid())
+  encounterId   String    @unique @map("encounter_id")
+  seriesId      String    @map("series_id") // -> TokenSeries
+  sequence      Int // raw monotonic value within the series scope
+  displayNumber String    @map("display_number") // e.g. "N001"
+  issuedAt      DateTime  @default(now()) @map("issued_at")
+  voidedAt      DateTime? @map("voided_at")
+
+  @@unique([seriesId, sequence, issuedAt], name: "uq_token_seq")
+  @@index([encounterId])
+  @@map("tokens")
+}
+
+// Ordered position inside a doctor's live session queue. Volatile; the durable
+// record — Redis holds the fast ordering projection (ARCHITECTURE.md §5.4).
+model QueueEntry {
+  id           String          @id @default(uuid())
+  encounterId  String          @unique @map("encounter_id")
+  opSessionId  String          @map("op_session_id")
+  tokenId      String          @map("token_id")
+  state        QueueEntryState @default(WAITING)
+  orderKey     Float           @map("order_key") // engine-managed sort key
+  enqueuedAt   DateTime        @default(now()) @map("enqueued_at")
+  updatedAt    DateTime        @updatedAt @map("updated_at")
+
+  @@index([opSessionId, state])
+  @@map("queue_entries")
+}
+
+// The in-room state machine (ARCHITECTURE.md §6.2). ≤1 ACTIVE per doctor.
+model Consultation {
+  id                          String            @id @default(uuid())
+  encounterId                 String            @map("encounter_id")
+  doctorId                    String            @map("doctor_id")
+  roomId                      String?           @map("room_id")
+  state                       ConsultationState @default(PENDING)
+  startedAt                   DateTime?         @map("started_at")
+  pausedAt                    DateTime?         @map("paused_at")
+  resumedAt                   DateTime?         @map("resumed_at")
+  endedAt                     DateTime?         @map("ended_at")
+  // Emergency interruption link (ARCHITECTURE.md §8): the emergency consultation
+  // that paused this one.
+  interruptedByConsultationId String?           @map("interrupted_by_consultation_id")
+  isEmergency                 Boolean           @default(false) @map("is_emergency")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([encounterId])
+  @@index([doctorId, state])
+  @@map("consultations")
+}
+
+// A doctor's live consulting window for a date (replaces legacy QueueSession).
+// Decoupled from MORNING/EVENING — derives from a configurable SessionTemplate.
+model OpSession {
+  id                   String         @id @default(uuid())
+  doctorId             String         @map("doctor_id")
+  clinicId             String         @map("clinic_id")
+  serviceDate          DateTime       @map("service_date") @db.Date
+  sessionTemplateId    String?        @map("session_template_id")
+  state                OpSessionState @default(SCHEDULED)
+  activeConsultationId String?        @map("active_consultation_id")
+  openedAt             DateTime?      @map("opened_at")
+  closedAt             DateTime?      @map("closed_at")
+  createdAt            DateTime       @default(now()) @map("created_at")
+  updatedAt            DateTime       @updatedAt @map("updated_at")
+
+  @@index([doctorId, serviceDate])
+  @@map("op_sessions")
+}
+
+// Payment — DECOUPLED. May settle before, at-desk, or after; never gates a token.
+model OpPayment {
+  id          String        @id @default(uuid())
+  encounterId String        @map("encounter_id")
+  amount      Int
+  mode        OpPaymentMode
+  status      PaymentStatus @default(CREATED)
+  gatewayRefs Json?         @map("gateway_refs")
+  createdAt   DateTime      @default(now()) @map("created_at")
+  updatedAt   DateTime      @updatedAt @map("updated_at")
+
+  @@index([encounterId])
+  @@map("op_payments")
+}
+
+// ─── Configuration engine (ARCHITECTURE.md §10, Phase 11) ──
+// Resolved hospital → clinic → doctor (most specific wins). Zero code per hospital.
+
+// Configurable token category + numbering (ARCHITECTURE.md §5.2).
+model TokenSeries {
+  id          String           @id @default(uuid())
+  clinicId    String           @map("clinic_id")
+  code        String // hospital key, e.g. "NORMAL_OP"
+  label       String // "Normal OP"
+  prefix      String           @default("") // "N" (may be empty; NEVER hardcoded)
+  padWidth    Int              @default(3)
+  startAt     Int              @default(1)
+  resetPolicy TokenResetPolicy @default(PER_SESSION) @map("reset_policy")
+  fee         Int              @default(0)
+  active      Boolean          @default(true)
+  createdAt   DateTime         @default(now()) @map("created_at")
+  updatedAt   DateTime         @updatedAt @map("updated_at")
+
+  @@unique([clinicId, code], name: "uq_series_code")
+  @@index([clinicId])
+  @@map("token_series")
+}
+
+// Serving discipline for a live session across token categories (ARCHITECTURE.md §5.3).
+model QueuePolicy {
+  id          String          @id @default(uuid())
+  clinicId    String          @map("clinic_id")
+  doctorId    String?         @map("doctor_id") // null = clinic default
+  mode        QueuePolicyMode @default(SHARED_FIFO)
+  ratio       Json?           // {"SPECIAL_OP":2,"NORMAL_OP":1}
+  categories  Json?           // [{seriesCode, weight}]
+  skipRules   Json?           @map("skip_rules") // {maxSkips, dropAfter, reinsertPosition}
+  recallRules Json?           @map("recall_rules") // {windowMinutes, afterNoShow}
+  createdAt   DateTime        @default(now()) @map("created_at")
+  updatedAt   DateTime        @updatedAt @map("updated_at")
+
+  @@unique([clinicId, doctorId], name: "uq_policy_scope")
+  @@index([clinicId])
+  @@map("queue_policies")
+}
+
+// Recurring session schedule (replaces the appointment-era MORNING/EVENING).
+// expectedLoad replaces maxTokens: planning only, NEVER a queue cap.
+model SessionTemplate {
+  id           String   @id @default(uuid())
+  doctorId     String   @map("doctor_id")
+  clinicId     String   @map("clinic_id")
+  label        String   @default("") // free-form, e.g. "Morning", "Evening OP"
+  dayOfWeek    Int      @map("day_of_week") // 0=Sun … 6=Sat
+  startTime    String   @map("start_time") // "HH:MM" local
+  endTime      String?  @map("end_time")
+  expectedLoad Int      @default(0) @map("expected_load")
+  roomId       String?  @map("room_id")
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  @@index([doctorId, dayOfWeek])
+  @@map("session_templates")
+}
+
+// ─── Event store (ARCHITECTURE.md §12.1, Phase 13) ─────────
+// Append-only source of truth. State is a fold over these events; read models
+// (CQRS, Phase 14) are projections; the audit trail is inherent (§12.5).
+model DomainEvent {
+  id            String   @id @default(uuid())
+  streamType    String   @map("stream_type") // "Encounter" | "Consultation" | "OpSession" | "Config"
+  streamId      String   @map("stream_id") // aggregate id
+  version       Int // per-stream monotonic version (optimistic concurrency)
+  type          String // "TokenIssued", "PatientCalled", …
+  payload       Json
+  metadata      Json?    // {actorId, actorRole, clinicId, source, correlationId}
+  occurredAt    DateTime @default(now()) @map("occurred_at")
+  globalSeq     BigInt   @default(autoincrement()) @map("global_seq") // total order for replay
+
+  @@unique([streamType, streamId, version], name: "uq_stream_version")
+  @@index([streamType, streamId])
+  @@index([type, occurredAt])
+  @@index([globalSeq])
+  @@map("domain_events")
+}
+
+// ─── CQRS read side (ARCHITECTURE.md §12.2, Phase 14) ──────
+// Denormalized projection of one encounter's live queue state, maintained by the
+// projector folding the event stream. Optimized for the read models: live queue,
+// doctor dashboard, reception roster, display board, patient tracking. Fully
+// rebuildable from domain_events (drop + replay).
+model QueueReadModel {
+  encounterId String          @id @map("encounter_id")
+  clinicId    String          @map("clinic_id")
+  doctorId    String          @map("doctor_id")
+  opSessionId String?         @map("op_session_id")
+  patientName String          @map("patient_name")
+  tokenNumber String?         @map("token_number")
+  category    String? // TokenSeries.code
+  status      EncounterStatus
+  orderKey    Float?          @map("order_key")
+  isOverride  Boolean         @default(false) @map("is_override")
+  isEmergency Boolean         @default(false) @map("is_emergency")
+  // Registration source — carried for ANALYTICS read models ONLY, never ordering.
+  source      String?
+  updatedAt   DateTime        @default(now()) @updatedAt @map("updated_at")
+
+  @@index([opSessionId, status])
+  @@index([doctorId, status])
+  @@index([clinicId])
+  @@map("queue_read_model")
+}
+
+// Per-projector replay cursor (last globalSeq consumed). Lets a projector resume
+// deterministically and lets a rebuild start from 0 (Phase 13/14: event replay).
+model ProjectionCursor {
+  name      String   @id
+  globalSeq BigInt   @default(0) @map("global_seq")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@map("projection_cursors")
+}
+
+// ─── Configuration engine — generic scoped config (Phase 11) ──
+// Any hospital-specific behaviour NOT already modelled by a dedicated table
+// (TokenSeries/QueuePolicy/SessionTemplate) lives here as scoped key/value.
+// Resolution: DOCTOR → CLINIC → HOSPITAL → code default (most specific wins), so
+// onboarding a hospital is pure configuration — zero hospital-specific code.
+model HospitalConfig {
+  id        String   @id @default(uuid())
+  scopeType String   @map("scope_type") // HOSPITAL | CLINIC | DOCTOR
+  scopeId   String   @map("scope_id")
+  key       String
+  value     Json
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@unique([scopeType, scopeId, key], name: "uq_config")
+  @@index([key])
+  @@map("hospital_config")
+}
