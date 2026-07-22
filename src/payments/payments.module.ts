@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { QueueEngineModule } from '../queue-engine/queue-engine.module';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { SessionResolverModule } from '../bookings/session-resolver.module';
+import { OpMirrorModule } from '../op-mirror/op-mirror.module';
 import { PaymentsService } from './payments.service';
 import { PaymentCleanupService } from './payment-cleanup.service';
 import { PaymentsController } from './payments.controller';
@@ -15,7 +16,7 @@ import {
 // Step 5 — Payments (Razorpay). Token issued ONLY inside the confirmed,
 // idempotent handler, reusing the Queue Engine's enqueueBooking.
 @Module({
-  imports: [QueueEngineModule, NotificationsModule, SessionResolverModule],
+  imports: [QueueEngineModule, NotificationsModule, SessionResolverModule, OpMirrorModule],
   controllers: [PaymentsController],
   providers: [
     PaymentsService,
@@ -36,6 +37,6 @@ import {
       },
     },
   ],
-  exports: [PaymentsService],
+  exports: [PaymentsService, RAZORPAY_GATEWAY],
 })
 export class PaymentsModule {}

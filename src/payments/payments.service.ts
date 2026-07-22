@@ -7,12 +7,18 @@ import {
   NotFoundException,
   UnauthorizedException,
 } from '@nestjs/common';
-import { BookingSource, BookingStatus, PaymentStatus } from '@prisma/client';
+import {
+  BookingSource,
+  BookingStatus,
+  PaymentStatus,
+  RegistrationSource,
+} from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { ConsultationService } from '../queue-engine/consultation.service';
 import { SessionKey, TokenSource } from '../queue-engine/token.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { SessionResolverService } from '../bookings/session-resolver.service';
+import { OpMirrorService } from '../op-mirror/op-mirror.service';
 import {
   RAZORPAY_GATEWAY,
   RazorpayGateway,
@@ -48,6 +54,7 @@ export class PaymentsService {
     private readonly consult: ConsultationService,
     private readonly notifications: NotificationsService,
     private readonly sessionResolver: SessionResolverService,
+    private readonly mirror: OpMirrorService,
     @Inject(RAZORPAY_GATEWAY) private readonly razorpay: RazorpayGateway,
   ) {}
 
@@ -346,6 +353,19 @@ export class PaymentsService {
 
     // Booking Confirmed push — fires once, only on the path that issued the token.
     await this.notifications.bookingConfirmed(booking.id);
+
+    // Dual-write to the new engine (Task 2). Register-only: an app booking is
+    // intent — the patient checks in later (desk/geofence), and the token is
+    // issued then (registration ≠ token). Idempotent on the bookingId. Best
+    // effort — never affects the confirmed payment/booking above.
+    await this.mirror.mirror({
+      source: RegistrationSource.APP,
+      doctorId: booking.doctorId,
+      patientId: booking.patientId,
+      serviceDate: booking.sessionDate.toISOString().slice(0, 10),
+      idempotencyKey: booking.id,
+      legacyBookingId: booking.id,
+    });
 
     return {
       bookingId: booking.id,

@@ -14,6 +14,9 @@ import { ConsultationModule } from './consultation/consultation.module';
 import { OverrideModule } from './override/override.module';
 import { ReadSideModule } from './read-side/read-side.module';
 import { ConfigEngineModule } from './config-engine/config-engine.module';
+import { OpHttpModule } from './op-http/op-http.module';
+import { OpRealtimeModule } from './realtime/op-realtime.module';
+import { OpPaymentsModule } from './op-payments/op-payments.module';
 import { MigrationModule } from './migration/migration.module';
 import { QueueEngineModule } from './queue-engine/queue-engine.module';
 import { AuthModule } from './auth/auth.module';
@@ -45,6 +48,9 @@ import { DisplayModule } from './display/display.module';
     ConsultationModule,
     OverrideModule,
     ReadSideModule,
+    OpHttpModule,
+    OpRealtimeModule,
+    OpPaymentsModule,
     MigrationModule,
     TenantModule,
     RedisModule,

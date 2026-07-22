@@ -11,6 +11,7 @@ import {
   BookingStatus,
   PaymentStatus,
   Prisma,
+  RegistrationSource,
   SessionType,
 } from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
@@ -20,6 +21,7 @@ import { EtaService } from '../queue-engine/eta.service';
 import { QueueService } from '../queue-engine/queue.service';
 import { AuditService } from '../queue-engine/audit.service';
 import { PaymentsService } from '../payments/payments.service';
+import { OpMirrorService } from '../op-mirror/op-mirror.service';
 import { SessionKey, TokenSource } from '../queue-engine/token.service';
 import { SessionClaims } from '../auth/auth-token.service';
 import { SMS_SENDER, SmsSender } from '../auth/sms.sender';
@@ -63,6 +65,7 @@ export class VoiceService {
     private readonly eta: EtaService,
     private readonly audit: AuditService,
     private readonly payments: PaymentsService,
+    private readonly mirror: OpMirrorService,
   ) {}
 
   /** DID -> owning clinic. Unknown number is a 404 the agent surfaces as "sorry,
@@ -260,6 +263,21 @@ export class VoiceService {
       doctorName: doctor.name,
       clinicName: clinic.name,
       session,
+    });
+
+    // Dual-write to the new engine (Task 2). Register-only: the caller is not at
+    // the desk yet, so the token is issued later at reception check-in
+    // (registration ≠ token). Idempotent on callSid so a retried call maps to the
+    // same encounter. Best effort — never affects the real booking above.
+    await this.mirror.mirror({
+      source: RegistrationSource.VOICE_AGENT,
+      doctorId: req.doctorId,
+      patientId: patient.id,
+      mobile: req.patientPhone,
+      name: req.patientName ?? undefined,
+      serviceDate: resolved.sessionDate,
+      idempotencyKey: req.callSid,
+      legacyBookingId: updated.id,
     });
 
     return {

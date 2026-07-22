@@ -117,6 +117,60 @@ export class TenantService {
   }
 
   /**
+   * Authorize an action targeting a specific Encounter id (request-supplied).
+   * Reduces to "is this encounter's doctor in my scope" — the same DOCTOR/STAFF/
+   * ADMIN rules as {@link assertQueueAccess}. A foreign encounter is not-found
+   * (no cross-tenant existence leak).
+   */
+  async assertEncounterAccess(
+    claims: SessionClaims | undefined,
+    encounterId: string,
+  ): Promise<void> {
+    if (!claims) throw new ForbiddenException('missing identity');
+    const enc = await this.prisma.encounter.findUnique({
+      where: { id: encounterId },
+      select: { doctorId: true },
+    });
+    if (!enc) throw new NotFoundException('encounter not found');
+    await this.assertQueueAccess(claims, enc.doctorId);
+  }
+
+  /**
+   * Authorize an action targeting a specific OpSession id (request-supplied).
+   * Reduces to "is this session's doctor in my scope". Foreign session ->
+   * not-found.
+   */
+  async assertSessionAccess(
+    claims: SessionClaims | undefined,
+    opSessionId: string,
+  ): Promise<void> {
+    if (!claims) throw new ForbiddenException('missing identity');
+    const session = await this.prisma.opSession.findUnique({
+      where: { id: opSessionId },
+      select: { doctorId: true },
+    });
+    if (!session) throw new NotFoundException('session not found');
+    await this.assertQueueAccess(claims, session.doctorId);
+  }
+
+  /**
+   * Authorize an action targeting a specific Consultation id (request-supplied).
+   * Reduces to "is this consultation's doctor in my scope". Foreign -> not-found.
+   */
+  async assertConsultationAccess(
+    claims: SessionClaims | undefined,
+    consultationId: string,
+  ): Promise<void> {
+    if (!claims) throw new ForbiddenException('missing identity');
+    const consult = await this.prisma.consultation.findUnique({
+      where: { id: consultationId },
+      select: { doctorId: true },
+    });
+    if (!consult) throw new NotFoundException('consultation not found');
+    await this.assertQueueAccess(claims, consult.doctorId);
+  }
+
+  /**
    * Authorize an action targeting a specific booking id (also request-supplied).
    * PATIENT -> must own it; DOCTOR -> must be their booking; STAFF/ADMIN -> the
    * booking's clinic must fall inside their clinic/hospital scope.

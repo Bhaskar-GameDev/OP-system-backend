@@ -1,7 +1,24 @@
-import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
-import { BookingSource, BookingStatus, PaymentStatus, SessionType } from '@prisma/client';
+import {
+  ConflictException,
+  ForbiddenException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
+import {
+  BookingSource,
+  BookingStatus,
+  CheckInMethod,
+  OpPaymentMode,
+  PaymentStatus,
+  RegistrationSource,
+  SessionType,
+} from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { ConsultationService } from '../queue-engine/consultation.service';
+import { OpMirrorService } from '../op-mirror/op-mirror.service';
+import { LegacyRosterCompatService } from './legacy-roster-compat.service';
+import { CheckInService } from '../check-in/checkin.service';
+import { OpPaymentService } from '../op-payments/op-payment.service';
 import { SessionKey, TokenSource } from '../queue-engine/token.service';
 import {
   BookingRosterView,
@@ -33,6 +50,10 @@ export class ReceptionService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly consult: ConsultationService,
+    private readonly mirror: OpMirrorService,
+    private readonly rosterCompat: LegacyRosterCompatService,
+    private readonly checkInEngine: CheckInService,
+    private readonly opPayments: OpPaymentService,
   ) {}
 
   /**
@@ -105,6 +126,22 @@ export class ReceptionService {
       select: { id: true, patientId: true, tokenNumber: true, status: true },
     });
 
+    // Dual-write to the new engine (Task 2). The walk-in patient is at the desk,
+    // so this is the combined path: register + check-in + token + enqueue. Best
+    // effort — never blocks or fails the legacy booking above.
+    await this.mirror.mirror({
+      source: RegistrationSource.RECEPTION,
+      doctorId: input.doctorId,
+      patientId: updated.patientId,
+      mobile: input.mobile,
+      name: input.name,
+      serviceDate: input.sessionDate,
+      idempotencyKey: booking.id,
+      legacyBookingId: booking.id,
+      actorId: clinicId,
+      present: true,
+    });
+
     return {
       bookingId: updated.id,
       patientId: updated.patientId,
@@ -136,6 +173,12 @@ export class ReceptionService {
     if (!doctor) throw new NotFoundException('doctor not found');
     if (doctor.clinicId !== clinicId) {
       throw new ForbiddenException('doctor belongs to another clinic');
+    }
+
+    // Read cutover (Task 5, reversible): when this clinic is flipped, serve the
+    // roster from the new engine in the SAME wire shape. Default off -> legacy.
+    if (await this.rosterCompat.enabled(clinicId)) {
+      return this.rosterCompat.roster(session);
     }
 
     const rows = await this.prisma.booking.findMany({
@@ -178,7 +221,10 @@ export class ReceptionService {
         payment: { select: { id: true, amount: true, status: true } },
       },
     });
-    if (!booking) throw new NotFoundException('booking not found');
+    if (!booking) {
+      // Read cutover: an encounterId-backed roster row settles via OpPayment.
+      return this.collectPaymentEncounter(clinicId, bookingId);
+    }
     if (booking.doctor.clinicId !== clinicId) {
       throw new ForbiddenException('booking belongs to another clinic');
     }
@@ -192,6 +238,36 @@ export class ReceptionService {
       });
     }
     return { bookingId: booking.id, paid: true, amountPaise: booking.payment.amount };
+  }
+
+  /**
+   * Desk payment collection for an Encounter-backed roster row: settle a decoupled
+   * OpPayment (CASH) — never gates a token. Idempotent: an existing SUCCESS desk
+   * payment is returned rather than double-charged.
+   */
+  private async collectPaymentEncounter(
+    clinicId: string,
+    encounterId: string,
+  ): Promise<CollectPaymentView> {
+    const enc = await this.prisma.encounter.findUnique({
+      where: { id: encounterId },
+      select: { id: true, clinicId: true },
+    });
+    if (!enc) throw new NotFoundException('booking not found');
+    if (enc.clinicId !== clinicId) {
+      throw new ForbiddenException('booking belongs to another clinic');
+    }
+    const existing = await this.prisma.opPayment.findFirst({
+      where: { encounterId, status: PaymentStatus.SUCCESS },
+      select: { amount: true },
+    });
+    if (existing) {
+      return { bookingId: encounterId, paid: true, amountPaise: existing.amount };
+    }
+    const pay = await this.opPayments.settleAtDesk(encounterId, OpPaymentMode.CASH, {
+      actorId: 'reception',
+    });
+    return { bookingId: encounterId, paid: true, amountPaise: pay.amount };
   }
 
   /** Doctors in the caller's clinic, for the queue-monitoring picker. */
@@ -218,7 +294,12 @@ export class ReceptionService {
       where: { id: bookingId },
       select: { id: true, checkedInAt: true, doctor: { select: { clinicId: true } } },
     });
-    if (!booking) throw new NotFoundException('booking not found');
+    if (!booking) {
+      // Read cutover: the id may be a new-engine encounterId (roster rows without
+      // a legacy booking carry the encounterId as bookingId). Route to the token
+      // engine's check-in so the reception app keeps working unchanged.
+      return this.setArrivedEncounter(clinicId, bookingId, arrived);
+    }
     if (booking.doctor.clinicId !== clinicId) {
       throw new ForbiddenException('booking belongs to another clinic');
     }
@@ -239,5 +320,36 @@ export class ReceptionService {
       select: { id: true, checkedInAt: true },
     });
     return toCheckInView(updated);
+  }
+
+  /**
+   * New-engine check-in for a roster row backed by an Encounter (not a legacy
+   * Booking). Forward-only: the token engine's state machine has no "un-check-in",
+   * so clearing arrival is a 409 rather than a silent lie. Idempotent on re-check.
+   */
+  private async setArrivedEncounter(
+    clinicId: string,
+    encounterId: string,
+    arrived: boolean,
+  ): Promise<CheckInView> {
+    const enc = await this.prisma.encounter.findUnique({
+      where: { id: encounterId },
+      select: { id: true, clinicId: true },
+    });
+    if (!enc) throw new NotFoundException('booking not found');
+    if (enc.clinicId !== clinicId) {
+      throw new ForbiddenException('booking belongs to another clinic');
+    }
+    if (!arrived) {
+      throw new ConflictException('check-in cannot be undone in the token engine');
+    }
+    const result = await this.checkInEngine.checkIn(encounterId, CheckInMethod.DESK, {
+      checkedInBy: 'reception',
+    });
+    return {
+      id: encounterId,
+      checkedInAt: result.checkIn.checkedInAt.toISOString(),
+      arrived: true,
+    };
   }
 }

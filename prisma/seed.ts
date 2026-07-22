@@ -17,7 +17,9 @@ import {
   BookingSource,
   BookingStatus,
   PaymentStatus,
+  QueuePolicyMode,
   SessionType,
+  TokenResetPolicy,
 } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 
@@ -603,6 +605,49 @@ async function cleanupLegacy(): Promise<void> {
   await prisma.clinic.deleteMany({ where: { id: legacyClinic } });
 }
 
+/**
+ * Token-engine config per demo clinic (Task 5): two configurable TokenSeries
+ * (Normal + Special), a clinic-default QueuePolicy, and a weekday SessionTemplate
+ * per doctor. This is what lets the NEW pipeline (register → check-in → token →
+ * enqueue) run for the demo data — without a series, token issuance has nothing
+ * to allocate from. Idempotent (upsert by natural key / deterministic id).
+ */
+async function seedOpConfig(): Promise<void> {
+  const opClinics = [CLINIC_A, CLINIC_C, CLINIC_B];
+  for (const clinicId of opClinics) {
+    await prisma.tokenSeries.upsert({
+      where: { uq_series_code: { clinicId, code: 'NORMAL_OP' } },
+      update: { label: 'Normal OP', prefix: 'N', padWidth: 3, startAt: 1, resetPolicy: TokenResetPolicy.PER_SESSION, active: true },
+      create: { clinicId, code: 'NORMAL_OP', label: 'Normal OP', prefix: 'N', padWidth: 3, startAt: 1, resetPolicy: TokenResetPolicy.PER_SESSION },
+    });
+    await prisma.tokenSeries.upsert({
+      where: { uq_series_code: { clinicId, code: 'SPECIAL_OP' } },
+      update: { label: 'Special OP', prefix: 'S', padWidth: 3, startAt: 101, resetPolicy: TokenResetPolicy.PER_SESSION, active: true },
+      create: { clinicId, code: 'SPECIAL_OP', label: 'Special OP', prefix: 'S', padWidth: 3, startAt: 101, resetPolicy: TokenResetPolicy.PER_SESSION },
+    });
+
+    // Clinic default policy (doctorId null): shared FIFO, interleave Special:Normal 2:1.
+    const policyId = `demo-policy-${clinicId.slice(-4)}`;
+    await prisma.queuePolicy.upsert({
+      where: { id: policyId },
+      update: { clinicId, doctorId: null, mode: QueuePolicyMode.SHARED_FIFO, ratio: { SPECIAL_OP: 2, NORMAL_OP: 1 } },
+      create: { id: policyId, clinicId, doctorId: null, mode: QueuePolicyMode.SHARED_FIFO, ratio: { SPECIAL_OP: 2, NORMAL_OP: 1 } },
+    });
+  }
+
+  // A weekday-morning session template per doctor (Mon–Sat).
+  for (const d of DOCTORS) {
+    for (let day = 1; day <= 6; day++) {
+      const id = `demo-tmpl-${d.id.slice(-4)}-${day}`;
+      await prisma.sessionTemplate.upsert({
+        where: { id },
+        update: { doctorId: d.id, clinicId: d.clinicId, label: 'Morning OP', dayOfWeek: day, startTime: '09:00', endTime: '13:00', expectedLoad: 30, active: true },
+        create: { id, doctorId: d.id, clinicId: d.clinicId, label: 'Morning OP', dayOfWeek: day, startTime: '09:00', endTime: '13:00', expectedLoad: 30 },
+      });
+    }
+  }
+}
+
 async function main(): Promise<void> {
   await cleanupLegacy();
   await seedHospitals();
@@ -612,6 +657,7 @@ async function main(): Promise<void> {
   await seedDoctors();
   await seedSchedules();
   await seedPatients();
+  await seedOpConfig();
   await seedBookings();
   await seedAudit();
   await seedNotes();
@@ -620,6 +666,7 @@ async function main(): Promise<void> {
   console.log('  Hospitals: City Health Network (City Care + Metro Care), Apollo Group (Apollo Hospitals)');
   console.log(`  Doctors : ${DOCTORS.length} (all password: doctor123)`);
   console.log(`  Patients: ${PATIENTS.length}`);
+  console.log('  OP config: TokenSeries (Normal+Special), QueuePolicy, SessionTemplate per demo clinic');
   console.log(`  Bookings: ${BOOKINGS.length} (completed / confirmed / expired)`);
   console.log(`  Notes   : ${NOTES.length} consultation notes on completed visits`);
   console.log('  Logins  : City Health Network -> admin/admin123, superadmin/superadmin123, reception/reception123');

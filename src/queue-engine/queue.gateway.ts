@@ -1,4 +1,5 @@
 import {
+  ForbiddenException,
   Logger,
   OnModuleDestroy,
   OnModuleInit,
@@ -17,6 +18,7 @@ import {
   SessionClaims,
 } from '../auth/auth-token.service';
 import { DisplayService } from '../display/display.service';
+import { QueueReadService } from '../read-side/queue-read.service';
 import { EtaService } from './eta.service';
 import { QueueService } from './queue.service';
 import { QueueEventsService } from './queue-events.service';
@@ -33,6 +35,21 @@ const sessionRoom = (s: SessionKey): string =>
   `session:${s.doctorId}:${s.sessionDate}:${s.sessionType}`;
 const bookingRoom = (bookingId: string): string => `booking:${bookingId}`;
 const displayRoom = (clinicId: string): string => `display:${clinicId}`;
+
+// New token-engine realtime rooms (Task 3), additive alongside the legacy rooms
+// above so the existing app contract is untouched.
+const OP_SESSION_PREFIX = 'op-session:';
+const OP_ENCOUNTER_PREFIX = 'op-encounter:';
+const opSessionRoom = (opSessionId: string): string =>
+  `${OP_SESSION_PREFIX}${opSessionId}`;
+const opEncounterRoom = (encounterId: string): string =>
+  `${OP_ENCOUNTER_PREFIX}${encounterId}`;
+
+interface OpJoinPayload {
+  kind: 'session' | 'encounter';
+  opSessionId?: string; // kind: 'session'
+  encounterId?: string; // kind: 'encounter'
+}
 
 /**
  * Realtime queue transport.
@@ -69,6 +86,7 @@ export class QueueGateway
     private readonly prisma: PrismaService,
     private readonly tenant: TenantService,
     private readonly display: DisplayService,
+    private readonly reads: QueueReadService,
   ) {}
 
   onModuleInit(): void {
@@ -305,6 +323,127 @@ export class QueueGateway
         `display broadcast failed for ${session.doctorId}: ${String(err)}`,
       );
     }
+  }
+
+  // ── new token-engine realtime (Task 3) ──────────────────
+  //
+  // Additive surface over the SAME socket server. Clients join by opSessionId
+  // (staff/doctor) or encounterId (patient) and receive read-model snapshots +
+  // live deltas fed by the projection tick (OpProjectionScheduler). The legacy
+  // rooms/events above are deliberately left untouched — the current apps keep
+  // working exactly as before until the Task 5 read cutover.
+
+  /** Join an op-engine room and receive an immediate snapshot. */
+  @SubscribeMessage('op:join')
+  async onOpJoin(client: Socket, payload: OpJoinPayload): Promise<void> {
+    if (client.data.display) {
+      client.emit('error', { message: 'forbidden' });
+      return;
+    }
+    const claims = client.data.claims as SessionClaims | undefined;
+    if (!claims) {
+      client.disconnect(true);
+      return;
+    }
+    try {
+      if (payload?.kind === 'session' && payload.opSessionId) {
+        await this.tenant.assertSessionAccess(claims, payload.opSessionId);
+        await client.join(opSessionRoom(payload.opSessionId));
+        client.emit('op:snapshot', {
+          kind: 'session',
+          opSessionId: payload.opSessionId,
+          ...(await this.opSessionState(payload.opSessionId)),
+        });
+      } else if (payload?.kind === 'encounter' && payload.encounterId) {
+        await this.assertEncounterVisibility(claims, payload.encounterId);
+        await client.join(opEncounterRoom(payload.encounterId));
+        client.emit('op:snapshot', {
+          kind: 'encounter',
+          encounterId: payload.encounterId,
+          tracking: await this.reads.patientTracking(payload.encounterId),
+        });
+      } else {
+        client.emit('error', { message: 'op:join requires kind + id' });
+      }
+    } catch {
+      client.emit('error', { message: 'forbidden' });
+    }
+  }
+
+  /** A patient may watch only their OWN encounter; staff/doctor use tenant scope. */
+  private async assertEncounterVisibility(
+    claims: SessionClaims,
+    encounterId: string,
+  ): Promise<void> {
+    if (claims.role === 'PATIENT') {
+      const enc = await this.prisma.encounter.findUnique({
+        where: { id: encounterId },
+        select: { patientId: true },
+      });
+      if (!enc || enc.patientId !== claims.sub) {
+        throw new ForbiddenException('not your encounter');
+      }
+      return;
+    }
+    await this.tenant.assertEncounterAccess(claims, encounterId);
+  }
+
+  private async opSessionState(
+    opSessionId: string,
+  ): Promise<{ waiting: unknown; display: unknown }> {
+    const [waiting, display] = await Promise.all([
+      this.reads.liveQueue(opSessionId),
+      this.reads.displayBoard(opSessionId),
+    ]);
+    return { waiting, display };
+  }
+
+  /** Push the current read-model state to a watched op session (no-op if empty). */
+  async broadcastOpSession(opSessionId: string): Promise<void> {
+    if (!this.server) return;
+    const room = this.server.sockets.adapter.rooms.get(
+      opSessionRoom(opSessionId),
+    );
+    if (!room || room.size === 0) return;
+    const state = await this.opSessionState(opSessionId);
+    this.server
+      .to(opSessionRoom(opSessionId))
+      .emit('op:queue:update', { opSessionId, ...state });
+  }
+
+  /** Push a single patient's live tracking to their private encounter channel. */
+  async broadcastOpEncounter(encounterId: string): Promise<void> {
+    if (!this.server) return;
+    const room = this.server.sockets.adapter.rooms.get(
+      opEncounterRoom(encounterId),
+    );
+    if (!room || room.size === 0) return;
+    const tracking = await this.reads.patientTracking(encounterId);
+    this.server
+      .to(opEncounterRoom(encounterId))
+      .emit('op:tracking:update', { encounterId, tracking });
+  }
+
+  /**
+   * Re-push current state to every op room that currently has a subscriber.
+   * Called by the projection tick after new events are applied — bounded by the
+   * number of watched sessions/encounters (connected staff + patients), so it is
+   * a handful of read-model reads, never a full scan.
+   */
+  async refreshActiveOpRooms(): Promise<void> {
+    if (!this.server) return;
+    const jobs: Promise<void>[] = [];
+    for (const [name, members] of this.server.sockets.adapter.rooms) {
+      if (members.size === 0) continue;
+      if (name.startsWith(OP_SESSION_PREFIX)) {
+        jobs.push(this.broadcastOpSession(name.slice(OP_SESSION_PREFIX.length)));
+      } else if (name.startsWith(OP_ENCOUNTER_PREFIX)) {
+        jobs.push(
+          this.broadcastOpEncounter(name.slice(OP_ENCOUNTER_PREFIX.length)),
+        );
+      }
+    }
+    await Promise.all(jobs);
   }
 }
 

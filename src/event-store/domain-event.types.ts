@@ -8,7 +8,12 @@
  */
 
 /** Aggregate stream a domain event belongs to. */
-export type StreamType = 'Encounter' | 'Consultation' | 'OpSession' | 'Config';
+export type StreamType =
+  | 'Encounter'
+  | 'Consultation'
+  | 'OpSession'
+  | 'OpPayment'
+  | 'Config';
 
 /** Every domain event type emitted by the engine. */
 export const DomainEventType = {
