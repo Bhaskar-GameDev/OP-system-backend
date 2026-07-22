@@ -21,9 +21,12 @@ import { BookingRosterView } from './reception.dto';
  * remains the default, so the suite and every un-flipped clinic are untouched.
  *
  * Known reduction: the new model has one session per doctor+day (no MORNING/
- * EVENING split), so a flipped roster returns the whole day's token-holders for
- * the doctor. Only token-holding encounters appear (mirrors the legacy exclusion
- * of PENDING_PAYMENT).
+ * EVENING split), so a flipped roster returns the whole day's encounters for the
+ * doctor. Unlike the legacy roster it ALSO surfaces pre-token encounters
+ * (register-only app/voice patients, tokenNumber null) so the desk can check them
+ * in — that check-in is what issues their token + enqueues them into the new
+ * engine (see ReceptionService.setArrivedEncounter). Without this they would be
+ * invisible on a flipped desk and could never be processed.
  */
 @Injectable()
 export class LegacyRosterCompatService {
@@ -67,8 +70,8 @@ export class LegacyRosterCompatService {
     const rows: BookingRosterView[] = [];
     for (const e of encounters) {
       const tokenNumber = tokenBy.get(e.id) ?? null;
-      // Mirror the legacy roster: only token-holders (skip pre-token intents).
-      if (!tokenNumber) continue;
+      // Include pre-token (register-only) encounters too — checking them in at the
+      // desk is what issues their token + enqueues them.
       const source = sourceBy.get(e.id);
       const checkedInAt = checkInBy.get(e.id) ?? null;
       const pays = paysBy.get(e.id) ?? [];

@@ -12,6 +12,7 @@ import {
 } from '@prisma/client';
 import { AppModule } from '../src/app.module';
 import { PrismaService } from '../src/common/prisma/prisma.service';
+import { RedisService } from '../src/common/redis/redis.service';
 import { AuthTokenService } from '../src/auth/auth-token.service';
 import { OpConfigService } from '../src/config-engine/op-config.service';
 
@@ -25,6 +26,7 @@ describe('Reception roster read cutover (flag off == flag on shape)', () => {
   let app: INestApplication;
   let url: string;
   let prisma: PrismaService;
+  let redis: RedisService;
   let config: OpConfigService;
 
   const stamp = Date.now();
@@ -36,9 +38,11 @@ describe('Reception roster read cutover (flag off == flag on shape)', () => {
   const DATE = '2026-10-05';
   const MOBILE = '7600000001';
   const MOBILE2 = '7600000002';
+  const MOBILE3 = '7600000003';
   const FEE = 40000;
   let encounterId = '';
   let enc2Id = ''; // new-native: no legacy booking, roster bookingId === encounterId
+  let enc3Id = ''; // register-only: no token yet (app/voice mirror), checked in at desk
   let staff = '';
 
   beforeAll(async () => {
@@ -47,6 +51,7 @@ describe('Reception roster read cutover (flag off == flag on shape)', () => {
     await app.listen(0);
     url = `http://127.0.0.1:${(app.getHttpServer().address() as AddressInfo).port}`;
     prisma = app.get(PrismaService);
+    redis = app.get(RedisService);
     config = app.get(OpConfigService);
     staff = app.get(AuthTokenService).sign({ sub: 'rc-staff', role: 'STAFF', clinicId: CLINIC, hospitalId: HOSP });
 
@@ -80,6 +85,15 @@ describe('Reception roster read cutover (flag off == flag on shape)', () => {
     await prisma.registration.create({ data: { encounterId: enc2Id, source: RegistrationSource.APP } });
     await prisma.token.create({ data: { encounterId: enc2Id, seriesId: SERIES, sequence: 6, displayNumber: 'W006' } });
     await prisma.checkIn.create({ data: { encounterId: enc2Id, method: CheckInMethod.DESK, checkedInAt: new Date(DATE) } });
+
+    // A REGISTER-ONLY encounter (app/voice mirror): NO token, NOT in the queue —
+    // the desk must still see it on a flipped roster to process it.
+    const p3 = await prisma.patient.create({ data: { mobile: MOBILE3, name: 'RC Pending' } });
+    const enc3 = await prisma.encounter.create({
+      data: { patientId: p3.id, hospitalId: HOSP, clinicId: CLINIC, doctorId: DOCTOR, serviceDate: new Date(DATE), opCategoryId: SERIES, status: EncounterStatus.REGISTERED },
+    });
+    enc3Id = enc3.id;
+    await prisma.registration.create({ data: { encounterId: enc3Id, source: RegistrationSource.APP } });
   });
 
   afterAll(async () => {
@@ -89,16 +103,25 @@ describe('Reception roster read cutover (flag off == flag on shape)', () => {
 
   async function cleanup(): Promise<void> {
     await prisma.hospitalConfig.deleteMany({ where: { scopeId: CLINIC } }).catch(() => {});
+    const sessions = await prisma.opSession.findMany({ where: { doctorId: DOCTOR }, select: { id: true } }).catch(() => [] as { id: string }[]);
+    for (const s of sessions) {
+      const keys = await redis.redis.keys(`pfos:*${s.id}*`).catch(() => [] as string[]);
+      if (keys.length) await redis.redis.del(...keys);
+    }
+    const seq = await redis.redis.keys(`pfos:tokenseq:${SERIES}:*`).catch(() => [] as string[]);
+    if (seq.length) await redis.redis.del(...seq);
     const ids = (await prisma.encounter.findMany({ where: { doctorId: DOCTOR }, select: { id: true } }).catch(() => [] as { id: string }[])).map((e) => e.id);
     const w = { encounterId: { in: ids } };
+    await prisma.queueEntry.deleteMany({ where: w }).catch(() => {});
     await prisma.opPayment.deleteMany({ where: w }).catch(() => {});
     await prisma.token.deleteMany({ where: w }).catch(() => {});
     await prisma.checkIn.deleteMany({ where: w }).catch(() => {});
     await prisma.registration.deleteMany({ where: w }).catch(() => {});
     await prisma.domainEvent.deleteMany({ where: { streamId: { in: ids } } }).catch(() => {});
     await prisma.encounter.deleteMany({ where: { doctorId: DOCTOR } }).catch(() => {});
+    await prisma.opSession.deleteMany({ where: { doctorId: DOCTOR } }).catch(() => {});
     await prisma.booking.deleteMany({ where: { id: BOOKING } }).catch(() => {});
-    await prisma.patient.deleteMany({ where: { mobile: { in: [MOBILE, MOBILE2] } } }).catch(() => {});
+    await prisma.patient.deleteMany({ where: { mobile: { in: [MOBILE, MOBILE2, MOBILE3] } } }).catch(() => {});
     await prisma.tokenSeries.deleteMany({ where: { id: SERIES } }).catch(() => {});
     await prisma.doctor.deleteMany({ where: { id: DOCTOR } }).catch(() => {});
     await prisma.clinic.deleteMany({ where: { id: CLINIC } }).catch(() => {});
@@ -187,5 +210,30 @@ describe('Reception roster read cutover (flag off == flag on shape)', () => {
     const again = await collect(enc2Id);
     expect(((await again.json()) as { amountPaise: number }).amountPaise).toBe(FEE);
     expect(await prisma.opPayment.count({ where: { encounterId: enc2Id, status: 'SUCCESS' } })).toBe(1);
+  });
+
+  // ── the gap-closer: register-only (pre-token) patients on a flipped desk ──
+
+  it('flipped roster surfaces a register-only encounter with no token yet', async () => {
+    await config.set('CLINIC', CLINIC, 'reads.cutover.roster', true);
+    const rows = await roster();
+    const pending = rows.find((r) => r.bookingId === enc3Id);
+    expect(pending).toBeDefined();
+    expect(pending!.tokenNumber).toBeNull(); // not tokenised yet
+    await config.set('CLINIC', CLINIC, 'reads.cutover.roster', false);
+  });
+
+  it('marking a register-only encounter arrived issues its token and enqueues it', async () => {
+    // pre-condition: no token, not in the queue
+    expect(await prisma.token.findUnique({ where: { encounterId: enc3Id } })).toBeNull();
+
+    const res = await patchCheckin(enc3Id, true);
+    expect(res.status).toBe(200);
+
+    // now fully processed into the new engine: token issued + queue entry + WAITING
+    const token = await prisma.token.findUnique({ where: { encounterId: enc3Id } });
+    expect(token?.displayNumber).toMatch(/^W\d{3}$/);
+    expect(await prisma.queueEntry.findUnique({ where: { encounterId: enc3Id } })).not.toBeNull();
+    expect((await prisma.encounter.findUniqueOrThrow({ where: { id: enc3Id } })).status).toBe(EncounterStatus.WAITING);
   });
 });

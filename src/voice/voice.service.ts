@@ -9,6 +9,7 @@ import {
 import {
   BookingSource,
   BookingStatus,
+  EncounterStatus,
   PaymentStatus,
   Prisma,
   RegistrationSource,
@@ -22,6 +23,7 @@ import { QueueService } from '../queue-engine/queue.service';
 import { AuditService } from '../queue-engine/audit.service';
 import { PaymentsService } from '../payments/payments.service';
 import { OpMirrorService } from '../op-mirror/op-mirror.service';
+import { OpConfigService } from '../config-engine/op-config.service';
 import { SessionKey, TokenSource } from '../queue-engine/token.service';
 import { SessionClaims } from '../auth/auth-token.service';
 import { SMS_SENDER, SmsSender } from '../auth/sms.sender';
@@ -66,6 +68,7 @@ export class VoiceService {
     private readonly audit: AuditService,
     private readonly payments: PaymentsService,
     private readonly mirror: OpMirrorService,
+    private readonly config: OpConfigService,
   ) {}
 
   /** DID -> owning clinic. Unknown number is a 404 the agent surfaces as "sorry,
@@ -116,7 +119,21 @@ export class VoiceService {
         sessionType: s.sessionType,
       };
       // A new joiner lands at the back: their wait = current queue size × avg.
-      const waiting = await this.queue.size(session);
+      // Read cutover (reversible, per-clinic): when flipped, count the NEW engine's
+      // live queue for this doctor instead of the legacy queue. Aggregate only, so
+      // no per-caller token divergence — the agent just quotes an accurate wait.
+      let waiting = await this.queue.size(session);
+      if (
+        await this.config.get(
+          'reads.cutover.voiceAvailability',
+          { clinicId: clinic.id },
+          false,
+        )
+      ) {
+        waiting = await this.prisma.queueReadModel.count({
+          where: { doctorId: d.id, status: EncounterStatus.WAITING },
+        });
+      }
       out.push({
         doctorId: d.id,
         doctorName: d.name,

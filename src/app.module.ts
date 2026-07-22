@@ -17,6 +17,7 @@ import { ConfigEngineModule } from './config-engine/config-engine.module';
 import { OpHttpModule } from './op-http/op-http.module';
 import { OpRealtimeModule } from './realtime/op-realtime.module';
 import { OpPaymentsModule } from './op-payments/op-payments.module';
+import { OpDoctorModule } from './op-doctor/op-doctor.module';
 import { MigrationModule } from './migration/migration.module';
 import { QueueEngineModule } from './queue-engine/queue-engine.module';
 import { AuthModule } from './auth/auth.module';
@@ -51,6 +52,7 @@ import { DisplayModule } from './display/display.module';
     OpHttpModule,
     OpRealtimeModule,
     OpPaymentsModule,
+    OpDoctorModule,
     MigrationModule,
     TenantModule,
     RedisModule,

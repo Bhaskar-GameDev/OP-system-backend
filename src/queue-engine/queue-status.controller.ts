@@ -14,6 +14,7 @@ import { Roles } from '../auth/roles.decorator';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { EtaService } from './eta.service';
 import { QueueService } from './queue.service';
+import { PatientStatusCompatService } from './patient-status-compat.service';
 import { SessionKey } from './token.service';
 
 type QueueStatusLabel = 'waiting' | 'next' | 'in_consultation' | 'done';
@@ -46,6 +47,7 @@ export class QueueStatusController {
     private readonly prisma: PrismaService,
     private readonly eta: EtaService,
     private readonly queue: QueueService,
+    private readonly patientCompat: PatientStatusCompatService,
   ) {}
 
   /**
@@ -62,6 +64,12 @@ export class QueueStatusController {
     if (!patientId) throw new ForbiddenException('missing patient identity');
 
     const booking = await this.resolveBooking(patientId, bookingId);
+
+    // Read cutover (reversible, per-clinic flag): serve from the new engine when
+    // this patient's encounter is in the new queue, else fall through to legacy.
+    const cutover = await this.patientCompat.tryStatus(booking);
+    if (cutover) return cutover;
+
     const token = booking.tokenNumber;
     if (!token) {
       // no token issued yet (still pending payment) — nothing to track

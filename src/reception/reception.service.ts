@@ -19,6 +19,7 @@ import { OpMirrorService } from '../op-mirror/op-mirror.service';
 import { LegacyRosterCompatService } from './legacy-roster-compat.service';
 import { CheckInService } from '../check-in/checkin.service';
 import { OpPaymentService } from '../op-payments/op-payment.service';
+import { OpQueueService } from '../queue/op-queue.service';
 import { SessionKey, TokenSource } from '../queue-engine/token.service';
 import {
   BookingRosterView,
@@ -54,6 +55,7 @@ export class ReceptionService {
     private readonly rosterCompat: LegacyRosterCompatService,
     private readonly checkInEngine: CheckInService,
     private readonly opPayments: OpPaymentService,
+    private readonly opQueue: OpQueueService,
   ) {}
 
   /**
@@ -343,9 +345,14 @@ export class ReceptionService {
     if (!arrived) {
       throw new ConflictException('check-in cannot be undone in the token engine');
     }
+    // Marking a patient arrived at the desk processes them fully into the new
+    // queue: check in (issuing the token if not already issued) then enqueue.
+    // All steps are idempotent, so a token-holder already in the queue is a no-op.
     const result = await this.checkInEngine.checkIn(encounterId, CheckInMethod.DESK, {
       checkedInBy: 'reception',
+      issueToken: true,
     });
+    await this.opQueue.enqueue(encounterId).catch(() => undefined);
     return {
       id: encounterId,
       checkedInAt: result.checkIn.checkedInAt.toISOString(),
