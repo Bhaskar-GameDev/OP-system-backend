@@ -4,12 +4,17 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { BookingStatus } from '@prisma/client';
+import { BookingStatus, SessionType } from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { RedisService } from '../common/redis/redis.service';
 import { QueueService, QueueEntry } from './queue.service';
 import { QueueEventsService } from './queue-events.service';
-import { SessionKey, TokenSource } from './token.service';
+import {
+  SessionKey,
+  TokenSource,
+  tokenCounterKey,
+  tokenPrefix,
+} from './token.service';
 
 const LOCK_TTL_MS = 5000;
 const LOCK_RETRY_MS = 15;
@@ -121,6 +126,43 @@ export class ConsultationService {
   }
 
   /**
+   * Highest token sequence Postgres already holds for this session + prefix.
+   *
+   * Only consulted when the Redis counter is missing: Redis is volatile and
+   * Postgres is not, so a wiped/restarted Redis would otherwise restart at
+   * A001 and collide with rows that already exist (unique index on
+   * doctor_id + session_date + session_type + token_number). Returns 0 when
+   * there is nothing to catch up to. See BASELINE note in queue.service.
+   */
+  private async tokenBaselineFor(
+    source: TokenSource,
+    session: SessionKey,
+  ): Promise<number> {
+    const exists = await this.redisService.redis.exists(
+      tokenCounterKey(source, session),
+    );
+    if (exists) return 0; // counter is live — never override it
+
+    const prefix = tokenPrefix(source);
+    const rows = await this.prisma.booking.findMany({
+      where: {
+        doctorId: session.doctorId,
+        sessionDate: new Date(`${session.sessionDate}T00:00:00.000Z`),
+        sessionType: session.sessionType as SessionType,
+        tokenNumber: { startsWith: prefix },
+      },
+      select: { tokenNumber: true },
+    });
+
+    let max = 0;
+    for (const { tokenNumber } of rows) {
+      const seq = Number.parseInt((tokenNumber ?? '').slice(prefix.length), 10);
+      if (Number.isFinite(seq) && seq > max) max = seq;
+    }
+    return max;
+  }
+
+  /**
    * Enqueue a paid booking. If it lands at rank 0 (empty queue) it is promoted
    * to ACTIVE immediately — i.e. the doctor can see them now.
    */
@@ -129,7 +171,8 @@ export class ConsultationService {
     session: SessionKey,
     bookingId: string,
   ): Promise<QueueEntry> {
-    const entry = await this.queue.enqueue(source, session, bookingId);
+    const baseline = await this.tokenBaselineFor(source, session);
+    const entry = await this.queue.enqueue(source, session, bookingId, baseline);
     if (entry.isFront) {
       await this.promote(entry.tokenNumber, session);
     }
@@ -347,7 +390,13 @@ export class ConsultationService {
     bookingId: string,
   ): Promise<PriorityResult> {
     return this.withSessionLock(session, async () => {
-      const res = await this.queue.priorityInsert(source, session, bookingId);
+      const baseline = await this.tokenBaselineFor(source, session);
+      const res = await this.queue.priorityInsert(
+        source,
+        session,
+        bookingId,
+        baseline,
+      );
       if (res.status === 'PRECISION') {
         throw new ConflictException(
           'priority score precision exhausted for this gap; renormalization needed',

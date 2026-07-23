@@ -392,15 +392,29 @@ async function seedBookings(): Promise<void> {
   const d = today();
   bookingSessionDate.clear();
 
-  // The seed owns the demo doctors' sessions. Clear any existing bookings for
-  // them (across the dated window the demo uses) first so the fixed demo tokens
-  // never collide with rows left over from a prior demo / live run (unique:
-  // doctor+date+session+token). Idempotent: rows below are re-created by id.
-  const windowStart = startOfLocalDay(new Date(Date.now() - 7 * DAY_MS));
+  // The seed writes FIXED token numbers, so it must clear anything already
+  // holding one of those exact slots (unique: doctor+date+session+token).
+  //
+  // Scoped to the colliding slots ONLY — deliberately NOT "every booking for the
+  // demo doctors in a 7-day window", which is what this used to do. The seed
+  // re-runs on EVERY container start, so the broad delete silently destroyed
+  // live bookings made during a demo: register a walk-in, restart the backend,
+  // and the patient is gone from the DB while their token lingers in Redis
+  // (Redis is untouched here), leaving phantom tokens in the reception/doctor
+  // queues. Rows the seed owns are upserted by id below, so they need no delete.
+  const seedSlots = BOOKINGS.map((b) => {
+    const t = b.completed ? completedTimes(b) : null;
+    return {
+      doctorId: b.doctorId,
+      sessionDate: t ? t.sessionDate : d,
+      sessionType: b.sessionType,
+      tokenNumber: b.token,
+    };
+  });
   await prisma.booking.deleteMany({
     where: {
-      doctorId: { in: DOCTORS.map((doc) => doc.id) },
-      sessionDate: { gte: windowStart },
+      OR: seedSlots,
+      id: { notIn: BOOKINGS.map((b) => b.id) },
     },
   });
 
