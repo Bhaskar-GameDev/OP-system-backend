@@ -1,22 +1,20 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { SessionType } from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
+import { DAILY_SESSION_TYPE, END_OF_DAY } from '../common/session/daily-session';
 
 /**
- * Same-day session auto-resolution.
+ * Same-day session resolution.
  *
- * Booking is always "today" — the patient supplies a doctorId only, and we pick
- * which of that doctor's sessions scheduled today they join. The data model has
- * NO session end time (DoctorSession stores only `startTime`), so "has it ended"
- * is INFERRED:
- *   - a MORNING session ends when that doctor's EVENING session starts today
- *     (or at end-of-day if the doctor sits no evening today);
- *   - an EVENING session ends at end-of-day.
- * Among today's not-yet-ended sessions we assign the one starting soonest.
+ * Booking is always "today" and a doctor sits ONE session per day, so this
+ * resolves to that session if the doctor is scheduled today. The session runs
+ * from `startTime` until end-of-day — there is nothing later to bound it.
  *
- * Decided over adding a DoctorSession.endTime column so the admin session CRUD
- * (explicitly out of scope) stays untouched. If a real end time is added later,
- * `sessionEndMinutes` is the single place to swap the rule.
+ * Previously a MORNING session was treated as ending when the doctor's EVENING
+ * session began, which is how the old two-block model inferred an end time
+ * without an `endTime` column. With one continuous session per day that
+ * inference is gone: a doctor who has started is open for the rest of the day.
+ * See `common/session/daily-session.ts` for why the enum still exists.
  */
 
 export interface ResolvedSession {
@@ -32,7 +30,6 @@ export type TodaySession =
   | { status: 'OPEN'; session: ResolvedSession }
   | { status: 'NONE'; reason: 'NOT_SCHEDULED' | 'ENDED' };
 
-const END_OF_DAY = '24:00';
 
 @Injectable()
 export class SessionResolverService {
@@ -60,41 +57,29 @@ export class SessionResolverService {
     const today = doctor.sessions.filter((s) => s.daysOfWeek.includes(dow));
     if (today.length === 0) return { status: 'NONE', reason: 'NOT_SCHEDULED' };
 
-    // Earliest evening start today bounds when a morning session "ends".
-    const eveningStart = today
-      .filter((s) => s.sessionType === SessionType.EVENING)
+    // One session per day. Legacy data (or a schedule edited before the change)
+    // could still hold more than one row for today, so take the earliest start
+    // rather than assuming exactly one — the day is a single block either way.
+    const startTime = today
       .map((s) => s.startTime)
-      .sort()[0];
+      .sort((a, b) => a.localeCompare(b))[0];
 
-    const nowHm = hm(now);
-    const open = today
-      .map((s) => ({
-        sessionType: s.sessionType,
-        startTime: s.startTime,
-        endTime: this.sessionEndMinutes(s.sessionType, eveningStart),
-      }))
-      .filter((s) => nowHm < toMinutes(s.endTime))
-      .sort((a, b) => a.startTime.localeCompare(b.startTime));
+    // A day's session ends with the day, so the only "ENDED" case is a clock
+    // past midnight, which cannot happen for today. Kept as a guard, not a rule.
+    if (hm(now) >= toMinutes(END_OF_DAY)) {
+      return { status: 'NONE', reason: 'ENDED' };
+    }
 
-    if (open.length === 0) return { status: 'NONE', reason: 'ENDED' };
-
-    const chosen = open[0];
     return {
       status: 'OPEN',
       session: {
-        sessionType: chosen.sessionType,
+        sessionType: DAILY_SESSION_TYPE,
         sessionDate: ymdLocal(now),
-        startTime: chosen.startTime,
-        endTime: chosen.endTime,
+        startTime,
+        endTime: END_OF_DAY,
         fee: doctor.consultationFee,
       },
     };
-  }
-
-  /** Inferred end "HH:MM" for a session type given today's earliest evening start. */
-  private sessionEndMinutes(type: SessionType, eveningStart: string | undefined): string {
-    if (type === SessionType.MORNING && eveningStart) return eveningStart;
-    return END_OF_DAY;
   }
 }
 

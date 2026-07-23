@@ -2,7 +2,7 @@
  * Demo seed for Patient Flow OS.
  *
  * Populates a realistic, demo-ready dataset: 2 clinics, 5 doctors across
- * specialties (morning + evening sessions each), 12 patients, and a spread of
+ * specialties (ONE continuous session per doctor per day), 12 patients, and a spread of
  * bookings (completed / confirmed / expired) plus matching payments and audit
  * entries so booking history and the audit log are never empty.
  *
@@ -19,6 +19,7 @@ import {
   PaymentStatus,
   SessionType,
 } from '@prisma/client';
+import { DAILY_SESSION_TYPE } from '../src/common/session/daily-session';
 import * as bcrypt from 'bcrypt';
 
 const prisma = new PrismaClient();
@@ -192,15 +193,20 @@ async function seedStaff(): Promise<void> {
 // maxTokens is retained but is now informational ("expected load"), NOT a cap.
 const EVERY_DAY = [0, 1, 2, 3, 4, 5, 6];
 async function seedSchedules(): Promise<void> {
+  // ONE session per doctor per day — no morning/evening split. sessionType is a
+  // pinned constant (see common/session/daily-session.ts), never a time of day.
   const rows = [
-    { id: 'demo-sess-smith-am', doctorId: DR_SMITH, sessionType: SessionType.MORNING, startTime: '09:00', maxTokens: 20, daysOfWeek: EVERY_DAY },
-    { id: 'demo-sess-smith-pm', doctorId: DR_SMITH, sessionType: SessionType.EVENING, startTime: '17:00', maxTokens: 15, daysOfWeek: [1, 3, 5] },
-    { id: 'demo-sess-meera-am', doctorId: DR_MEERA, sessionType: SessionType.MORNING, startTime: '10:00', maxTokens: 18, daysOfWeek: EVERY_DAY },
-    { id: 'demo-sess-arjun-am', doctorId: DR_ARJUN, sessionType: SessionType.MORNING, startTime: '11:00', maxTokens: 16, daysOfWeek: EVERY_DAY },
-    { id: 'demo-sess-kavya-pm', doctorId: DR_KAVYA, sessionType: SessionType.EVENING, startTime: '16:30', maxTokens: 12, daysOfWeek: EVERY_DAY },
-    { id: 'demo-sess-sunita-am', doctorId: DR_SUNITA, sessionType: SessionType.MORNING, startTime: '09:30', maxTokens: 14, daysOfWeek: EVERY_DAY },
-    { id: 'demo-sess-sunita-a-am', doctorId: DR_SUNITA_A, sessionType: SessionType.MORNING, startTime: '10:30', maxTokens: 14, daysOfWeek: EVERY_DAY },
+    { id: 'demo-sess-smith-am', doctorId: DR_SMITH, sessionType: DAILY_SESSION_TYPE, startTime: '09:00', maxTokens: 20, daysOfWeek: EVERY_DAY },
+    { id: 'demo-sess-meera-am', doctorId: DR_MEERA, sessionType: DAILY_SESSION_TYPE, startTime: '10:00', maxTokens: 18, daysOfWeek: EVERY_DAY },
+    { id: 'demo-sess-arjun-am', doctorId: DR_ARJUN, sessionType: DAILY_SESSION_TYPE, startTime: '11:00', maxTokens: 16, daysOfWeek: EVERY_DAY },
+    { id: 'demo-sess-kavya-pm', doctorId: DR_KAVYA, sessionType: DAILY_SESSION_TYPE, startTime: '09:00', maxTokens: 12, daysOfWeek: EVERY_DAY },
+    { id: 'demo-sess-sunita-am', doctorId: DR_SUNITA, sessionType: DAILY_SESSION_TYPE, startTime: '09:30', maxTokens: 14, daysOfWeek: EVERY_DAY },
+    { id: 'demo-sess-sunita-a-am', doctorId: DR_SUNITA_A, sessionType: DAILY_SESSION_TYPE, startTime: '10:30', maxTokens: 14, daysOfWeek: EVERY_DAY },
   ];
+  // Dr Smith's old second (evening) block is explicitly removed, not just left
+  // out: the seed is idempotent by id, so an existing row would otherwise
+  // survive and break the one-session-per-day rule on a re-seed.
+  await prisma.doctorSession.deleteMany({ where: { id: 'demo-sess-smith-pm' } });
   for (const r of rows) {
     const { id, ...data } = r;
     await prisma.doctorSession.upsert({ where: { id }, update: data, create: { id, ...data } });
@@ -269,15 +275,20 @@ async function seedDoctors(): Promise<void> {
       },
     });
 
-    // morning + evening session record for today (durable session metadata;
-    // the live ordering itself lives in Redis and is built during the demo)
-    for (const sessionType of [SessionType.MORNING, SessionType.EVENING]) {
-      await prisma.queueSession.upsert({
-        where: { uq_session: { doctorId: d.id, sessionDate: today(), sessionType } },
-        update: {},
-        create: { doctorId: d.id, sessionDate: today(), sessionType, isOpen: true },
-      });
-    }
+    // One session record for today (durable session metadata; the live ordering
+    // itself lives in Redis and is built during the demo).
+    await prisma.queueSession.upsert({
+      where: {
+        uq_session: { doctorId: d.id, sessionDate: today(), sessionType: DAILY_SESSION_TYPE },
+      },
+      update: {},
+      create: {
+        doctorId: d.id,
+        sessionDate: today(),
+        sessionType: DAILY_SESSION_TYPE,
+        isOpen: true,
+      },
+    });
   }
 }
 
@@ -338,19 +349,19 @@ interface BookingSeed {
 // points and average-wait/consult come out positive and realistic.
 const BOOKINGS: BookingSeed[] = [
   // Dr Smith — two seen today, two waiting
-  { id: 'demo-bk-01', patientId: 'demo-pt-01', doctorId: DR_SMITH, sessionType: SessionType.MORNING, status: BookingStatus.COMPLETED, token: 'A001', fee: 500, payment: PaymentStatus.SUCCESS, paymentId: 'demo-pay-01', completed: true, dayOffset: 0, waitMinutes: 45, consultMinutes: 12 },
-  { id: 'demo-bk-02', patientId: 'demo-pt-02', doctorId: DR_SMITH, sessionType: SessionType.MORNING, status: BookingStatus.COMPLETED, token: 'A002', fee: 500, payment: PaymentStatus.SUCCESS, paymentId: 'demo-pay-02', completed: true, dayOffset: 0, waitMinutes: 30, consultMinutes: 10 },
-  { id: 'demo-bk-03', patientId: 'demo-pt-03', doctorId: DR_SMITH, sessionType: SessionType.MORNING, status: BookingStatus.BOOKED, token: 'A003', fee: 500, payment: PaymentStatus.SUCCESS, paymentId: 'demo-pay-03' },
-  { id: 'demo-bk-04', patientId: 'demo-pt-04', doctorId: DR_SMITH, sessionType: SessionType.MORNING, status: BookingStatus.BOOKED, token: 'A004', fee: 500, payment: PaymentStatus.SUCCESS, paymentId: 'demo-pay-04' },
+  { id: 'demo-bk-01', patientId: 'demo-pt-01', doctorId: DR_SMITH, sessionType: DAILY_SESSION_TYPE, status: BookingStatus.COMPLETED, token: 'A001', fee: 500, payment: PaymentStatus.SUCCESS, paymentId: 'demo-pay-01', completed: true, dayOffset: 0, waitMinutes: 45, consultMinutes: 12 },
+  { id: 'demo-bk-02', patientId: 'demo-pt-02', doctorId: DR_SMITH, sessionType: DAILY_SESSION_TYPE, status: BookingStatus.COMPLETED, token: 'A002', fee: 500, payment: PaymentStatus.SUCCESS, paymentId: 'demo-pay-02', completed: true, dayOffset: 0, waitMinutes: 30, consultMinutes: 10 },
+  { id: 'demo-bk-03', patientId: 'demo-pt-03', doctorId: DR_SMITH, sessionType: DAILY_SESSION_TYPE, status: BookingStatus.BOOKED, token: 'A003', fee: 500, payment: PaymentStatus.SUCCESS, paymentId: 'demo-pay-03' },
+  { id: 'demo-bk-04', patientId: 'demo-pt-04', doctorId: DR_SMITH, sessionType: DAILY_SESSION_TYPE, status: BookingStatus.BOOKED, token: 'A004', fee: 500, payment: PaymentStatus.SUCCESS, paymentId: 'demo-pay-04' },
   // Dr Smith — a failed/expired payment (never got a token)
-  { id: 'demo-bk-05', patientId: 'demo-pt-06', doctorId: DR_SMITH, sessionType: SessionType.MORNING, status: BookingStatus.EXPIRED, token: null, fee: 500, payment: PaymentStatus.FAILED, paymentId: 'demo-pay-05' },
+  { id: 'demo-bk-05', patientId: 'demo-pt-06', doctorId: DR_SMITH, sessionType: DAILY_SESSION_TYPE, status: BookingStatus.EXPIRED, token: null, fee: 500, payment: PaymentStatus.FAILED, paymentId: 'demo-pay-05' },
   // Dr Meera (pediatrics) — seen yesterday, one waiting today
-  { id: 'demo-bk-06', patientId: 'demo-pt-05', doctorId: DR_MEERA, sessionType: SessionType.MORNING, status: BookingStatus.COMPLETED, token: 'A001', fee: 400, payment: PaymentStatus.SUCCESS, paymentId: 'demo-pay-06', completed: true, dayOffset: 1, waitMinutes: 60, consultMinutes: 15 },
-  { id: 'demo-bk-07', patientId: 'demo-pt-11', doctorId: DR_MEERA, sessionType: SessionType.MORNING, status: BookingStatus.BOOKED, token: 'A002', fee: 400, payment: PaymentStatus.SUCCESS, paymentId: 'demo-pay-07' },
+  { id: 'demo-bk-06', patientId: 'demo-pt-05', doctorId: DR_MEERA, sessionType: DAILY_SESSION_TYPE, status: BookingStatus.COMPLETED, token: 'A001', fee: 400, payment: PaymentStatus.SUCCESS, paymentId: 'demo-pay-06', completed: true, dayOffset: 1, waitMinutes: 60, consultMinutes: 15 },
+  { id: 'demo-bk-07', patientId: 'demo-pt-11', doctorId: DR_MEERA, sessionType: DAILY_SESSION_TYPE, status: BookingStatus.BOOKED, token: 'A002', fee: 400, payment: PaymentStatus.SUCCESS, paymentId: 'demo-pay-07' },
   // Dr Kavya (ortho, clinic B) — evening, one waiting
-  { id: 'demo-bk-08', patientId: 'demo-pt-08', doctorId: DR_KAVYA, sessionType: SessionType.EVENING, status: BookingStatus.BOOKED, token: 'A001', fee: 700, payment: PaymentStatus.SUCCESS, paymentId: 'demo-pay-08' },
+  { id: 'demo-bk-08', patientId: 'demo-pt-08', doctorId: DR_KAVYA, sessionType: DAILY_SESSION_TYPE, status: BookingStatus.BOOKED, token: 'A001', fee: 700, payment: PaymentStatus.SUCCESS, paymentId: 'demo-pay-08' },
   // Dr Sunita (derma, clinic B) — seen two days ago
-  { id: 'demo-bk-09', patientId: 'demo-pt-12', doctorId: DR_SUNITA, sessionType: SessionType.MORNING, status: BookingStatus.COMPLETED, token: 'A001', fee: 600, payment: PaymentStatus.SUCCESS, paymentId: 'demo-pay-09', completed: true, dayOffset: 2, waitMinutes: 75, consultMinutes: 20 },
+  { id: 'demo-bk-09', patientId: 'demo-pt-12', doctorId: DR_SUNITA, sessionType: DAILY_SESSION_TYPE, status: BookingStatus.COMPLETED, token: 'A001', fee: 600, payment: PaymentStatus.SUCCESS, paymentId: 'demo-pay-09', completed: true, dayOffset: 2, waitMinutes: 75, consultMinutes: 20 },
 ];
 
 const DAY_MS = 86_400_000;
@@ -497,11 +508,11 @@ interface AuditSeed {
 // DONE entries for the completed consultations + one SKIP, so the audit log
 // shows real who-did-what activity.
 const AUDIT: AuditSeed[] = [
-  { id: 'demo-audit-01', doctorId: DR_SMITH, clinicId: CLINIC_A, action: 'DONE', token: 'A001', bookingId: 'demo-bk-01', sessionType: SessionType.MORNING },
-  { id: 'demo-audit-02', doctorId: DR_SMITH, clinicId: CLINIC_A, action: 'DONE', token: 'A002', bookingId: 'demo-bk-02', sessionType: SessionType.MORNING },
-  { id: 'demo-audit-03', doctorId: DR_SMITH, clinicId: CLINIC_A, action: 'SKIP', token: 'A003', bookingId: 'demo-bk-03', sessionType: SessionType.MORNING },
-  { id: 'demo-audit-04', doctorId: DR_MEERA, clinicId: CLINIC_A, action: 'DONE', token: 'A001', bookingId: 'demo-bk-06', sessionType: SessionType.MORNING },
-  { id: 'demo-audit-05', doctorId: DR_SUNITA, clinicId: CLINIC_B, action: 'DONE', token: 'A001', bookingId: 'demo-bk-09', sessionType: SessionType.MORNING },
+  { id: 'demo-audit-01', doctorId: DR_SMITH, clinicId: CLINIC_A, action: 'DONE', token: 'A001', bookingId: 'demo-bk-01', sessionType: DAILY_SESSION_TYPE },
+  { id: 'demo-audit-02', doctorId: DR_SMITH, clinicId: CLINIC_A, action: 'DONE', token: 'A002', bookingId: 'demo-bk-02', sessionType: DAILY_SESSION_TYPE },
+  { id: 'demo-audit-03', doctorId: DR_SMITH, clinicId: CLINIC_A, action: 'SKIP', token: 'A003', bookingId: 'demo-bk-03', sessionType: DAILY_SESSION_TYPE },
+  { id: 'demo-audit-04', doctorId: DR_MEERA, clinicId: CLINIC_A, action: 'DONE', token: 'A001', bookingId: 'demo-bk-06', sessionType: DAILY_SESSION_TYPE },
+  { id: 'demo-audit-05', doctorId: DR_SUNITA, clinicId: CLINIC_B, action: 'DONE', token: 'A001', bookingId: 'demo-bk-09', sessionType: DAILY_SESSION_TYPE },
 ];
 
 async function seedAudit(): Promise<void> {

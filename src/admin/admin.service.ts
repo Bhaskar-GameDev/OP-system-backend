@@ -4,8 +4,9 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { Prisma, SessionType } from '@prisma/client';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
+import { DAILY_SESSION_TYPE } from '../common/session/daily-session';
 import { TenantService } from '../common/tenant/tenant.service';
 import { PasswordService } from '../auth/password.service';
 import {
@@ -292,7 +293,7 @@ export class AdminService {
     const rows = await this.prisma.doctorSession.findMany({
       where: { doctorId },
       select: SESSION_SELECT,
-      orderBy: [{ sessionType: 'asc' }, { startTime: 'asc' }],
+      orderBy: [{ startTime: 'asc' }],
     });
     return rows.map(toAdminDoctorSession);
   }
@@ -304,15 +305,17 @@ export class AdminService {
   ): Promise<AdminDoctorSessionView> {
     await this.loadOwnDoctor(clinicId, doctorId);
 
-    const sessionType = parseSessionType(input.sessionType);
+    // sessionType is NOT read from the client: a doctor sits one session a day.
+    // Any value the caller sends is ignored rather than rejected, so older
+    // clients still posting "MORNING"/"EVENING" keep working.
     const startTime = parseStartTime(input.startTime);
     const maxTokens = parseMaxTokens(input.maxTokens);
     const daysOfWeek = parseDays(input.daysOfWeek);
 
-    await this.assertNoOverlap(doctorId, sessionType, daysOfWeek, null);
+    await this.assertNoOverlap(doctorId, daysOfWeek, null);
 
     const created = await this.prisma.doctorSession.create({
-      data: { doctorId, sessionType, startTime, maxTokens, daysOfWeek },
+      data: { doctorId, sessionType: DAILY_SESSION_TYPE, startTime, maxTokens, daysOfWeek },
       select: SESSION_SELECT,
     });
     return toAdminDoctorSession(created);
@@ -334,19 +337,15 @@ export class AdminService {
     }
 
     const data: Prisma.DoctorSessionUpdateInput = {};
-    const nextType =
-      input.sessionType !== undefined
-        ? parseSessionType(input.sessionType)
-        : existing.sessionType;
     const nextDays =
       input.daysOfWeek !== undefined ? parseDays(input.daysOfWeek) : existing.daysOfWeek;
-    if (input.sessionType !== undefined) data.sessionType = nextType;
+    // input.sessionType is deliberately ignored (see createSession).
     if (input.startTime !== undefined) data.startTime = parseStartTime(input.startTime);
     if (input.maxTokens !== undefined) data.maxTokens = parseMaxTokens(input.maxTokens);
     if (input.daysOfWeek !== undefined) data.daysOfWeek = nextDays;
 
-    // Re-check overlap against the resulting (type, days), ignoring this row.
-    await this.assertNoOverlap(doctorId, nextType, nextDays, sessionId);
+    // Re-check overlap against the resulting days, ignoring this row.
+    await this.assertNoOverlap(doctorId, nextDays, sessionId);
 
     const updated = await this.prisma.doctorSession.update({
       where: { id: sessionId },
@@ -379,14 +378,14 @@ export class AdminService {
    */
   private async assertNoOverlap(
     doctorId: string,
-    sessionType: SessionType,
     daysOfWeek: number[],
     ignoreId: string | null,
   ): Promise<void> {
+    // One session per doctor per weekday — the session type is no longer a
+    // discriminator, so ANY existing session on a wanted day is a clash.
     const siblings = await this.prisma.doctorSession.findMany({
       where: {
         doctorId,
-        sessionType,
         ...(ignoreId ? { id: { not: ignoreId } } : {}),
       },
       select: { daysOfWeek: true },
@@ -396,7 +395,7 @@ export class AdminService {
       const clash = s.daysOfWeek.find((d) => wanted.has(d));
       if (clash !== undefined) {
         throw new BadRequestException(
-          `overlapping ${sessionType} session on day ${clash} (same day + session type)`,
+          `this doctor already has a session on day ${clash} — one session per day`,
         );
       }
     }
@@ -446,13 +445,6 @@ function positiveFee(v: number | undefined): number | undefined {
   if (v === undefined) return undefined;
   if (!Number.isInteger(v) || v <= 0) {
     throw new BadRequestException('consultationFee must be a positive integer');
-  }
-  return v;
-}
-
-function parseSessionType(v: SessionType): SessionType {
-  if (v !== SessionType.MORNING && v !== SessionType.EVENING) {
-    throw new BadRequestException('sessionType must be MORNING or EVENING');
   }
   return v;
 }

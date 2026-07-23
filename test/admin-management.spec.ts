@@ -3,6 +3,7 @@ import { Test } from '@nestjs/testing';
 import { AddressInfo } from 'node:net';
 import { AppModule } from '../src/app.module';
 import { PrismaService } from '../src/common/prisma/prisma.service';
+import { DAILY_SESSION_TYPE } from '../src/common/session/daily-session';
 import { AuthTokenService } from '../src/auth/auth-token.service';
 
 /**
@@ -110,37 +111,43 @@ describe('Admin management (clinics / doctors / sessions)', () => {
     await prisma.doctor.delete({ where: { id: doc.id } });
   });
 
-  it('sessions: create, reject overlap (same day+type), allow different type/day', async () => {
+  it('sessions: one per weekday — a second session on a shared day is rejected', async () => {
     const docRes = await newDoctor({ name: 'Dr Sched', consultationFee: 300 });
     const doc = (await docRes.json()) as { id: string };
 
     const mk = (body: Record<string, unknown>) =>
       adminFetch(`/admin/doctors/${doc.id}/sessions`, { method: 'POST', body: JSON.stringify(body) });
 
-    const am = await mk({ sessionType: 'MORNING', startTime: '09:00', maxTokens: 20, daysOfWeek: [1, 2, 3] });
-    expect(am.status).toBe(201);
-    const amBody = (await am.json()) as { id: string; daysOfWeek: number[] };
-    expect(amBody.daysOfWeek).toEqual([1, 2, 3]);
+    const first = await mk({ startTime: '09:00', maxTokens: 20, daysOfWeek: [1, 2, 3] });
+    expect(first.status).toBe(201);
+    const firstBody = (await first.json()) as { id: string; daysOfWeek: number[] };
+    expect(firstBody.daysOfWeek).toEqual([1, 2, 3]);
 
-    // overlap: same MORNING type sharing Tuesday(2) -> 400
-    const clash = await mk({ sessionType: 'MORNING', startTime: '11:00', maxTokens: 10, daysOfWeek: [2, 4] });
+    // Sharing Tuesday(2) -> 400. A doctor consults ONE session per day, so the
+    // session type is no longer an escape hatch for a second block.
+    const clash = await mk({ startTime: '11:00', maxTokens: 10, daysOfWeek: [2, 4] });
     expect(clash.status).toBe(400);
 
-    // same days but EVENING type -> allowed
-    const pm = await mk({ sessionType: 'EVENING', startTime: '17:00', maxTokens: 12, daysOfWeek: [1, 2, 3] });
-    expect(pm.status).toBe(201);
+    // Previously allowed by declaring it an EVENING session — now still a clash.
+    const sameDays = await mk({ sessionType: 'EVENING', startTime: '17:00', maxTokens: 12, daysOfWeek: [1, 2, 3] });
+    expect(sameDays.status).toBe(400);
 
-    // same MORNING type but disjoint days -> allowed
-    const am2 = await mk({ sessionType: 'MORNING', startTime: '09:00', maxTokens: 8, daysOfWeek: [4, 5] });
-    expect(am2.status).toBe(201);
+    // Disjoint days -> allowed.
+    const other = await mk({ startTime: '09:00', maxTokens: 8, daysOfWeek: [4, 5] });
+    expect(other.status).toBe(201);
+
+    // A client still sending sessionType is accepted; the value is ignored and
+    // the row is stored pinned, so old reception builds keep working.
+    const stored = await prisma.doctorSession.findMany({ where: { doctorId: doc.id } });
+    expect(stored.every((r) => r.sessionType === DAILY_SESSION_TYPE)).toBe(true);
 
     // bad inputs
-    expect((await mk({ sessionType: 'MORNING', startTime: '25:00', maxTokens: 5, daysOfWeek: [6] })).status).toBe(400);
-    expect((await mk({ sessionType: 'MORNING', startTime: '08:00', maxTokens: 0, daysOfWeek: [6] })).status).toBe(400);
-    expect((await mk({ sessionType: 'MORNING', startTime: '08:00', maxTokens: 5, daysOfWeek: [] })).status).toBe(400);
+    expect((await mk({ startTime: '25:00', maxTokens: 5, daysOfWeek: [6] })).status).toBe(400);
+    expect((await mk({ startTime: '08:00', maxTokens: 0, daysOfWeek: [6] })).status).toBe(400);
+    expect((await mk({ startTime: '08:00', maxTokens: 5, daysOfWeek: [] })).status).toBe(400);
 
     const list = (await (await adminFetch(`/admin/doctors/${doc.id}/sessions`)).json()) as unknown[];
-    expect(list.length).toBe(3);
+    expect(list.length).toBe(2);
 
     await prisma.doctorSession.deleteMany({ where: { doctorId: doc.id } });
     await prisma.doctor.delete({ where: { id: doc.id } });
