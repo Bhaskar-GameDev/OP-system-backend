@@ -8,7 +8,7 @@ import { AppModule } from '../src/app.module';
 import { PrismaService } from '../src/common/prisma/prisma.service';
 import { AuthTokenService } from '../src/auth/auth-token.service';
 import { QueueService } from '../src/queue-engine/queue.service';
-import { SessionKey } from '../src/queue-engine/token.service';
+import { SessionKey, TokenSource } from '../src/queue-engine/token.service';
 
 /**
  * Multi-tenant ISOLATION — the cross-hospital boundary, proven end-to-end against
@@ -191,6 +191,67 @@ describe('Multi-tenant isolation (real infra)', () => {
     };
     expect(b.totals.total).toBe(1); // only B's booking — no cross-contamination
     expect(b.doctors.every((d) => d.doctorId === DOC_B)).toBe(true);
+  });
+
+  // ── /queue/* REST isolation ──────────────────────────────────────────────
+  //
+  // These routes take `doctorId` straight from the request, so role alone is not
+  // authorization: without a per-request scope check any authenticated staff or
+  // doctor token could read AND mutate any hospital's live queue (mark another
+  // hospital's patients no-show), and a doctor could drive a colleague's queue.
+  // The socket-join tests below cover the realtime side only — this covers the
+  // REST control surface, which is the one that actually changes state.
+
+  it('staff cannot READ another hospital queue via /queue/*', async () => {
+    const q = `doctorId=${DOC_B}&sessionDate=${DATE}&sessionType=MORNING`;
+    // staffB is legitimately in Hospital B — prove the fixture works before
+    // asserting the negative, so a blanket 403 can't fake a pass.
+    expect((await authGet(`/queue/list?${q}`, staffB)).status).toBe(200);
+
+    for (const path of [`/queue/list?${q}`, `/queue/eta-list?${q}`, `/queue/position?${q}&token=A001`, `/queue/eta?${q}&token=A001`]) {
+      const res = await authGet(path, adminA); // Hospital A admin reaching into B
+      expect([403, 404]).toContain(res.status);
+    }
+  });
+
+  it('staff cannot MUTATE another hospital queue via /queue/*', async () => {
+    await queue.clearSession(sessionB);
+    await queue.enqueue(TokenSource.APP, sessionB, 'ti-bk-b');
+    const before = await queue.listWithScores(sessionB);
+    expect(before).toHaveLength(1);
+
+    const body = { doctorId: DOC_B, sessionDate: DATE, sessionType: 'MORNING' };
+    for (const [path, extra] of [
+      ['/queue/done', { expectedToken: 'A001' }],
+      ['/queue/no-show', { token: 'A001' }],
+      ['/queue/skip', { token: 'A001' }],
+      ['/queue/priority', { bookingId: 'ti-bk-b', source: 'APP' }],
+      ['/queue/reinsert', { token: 'A002', afterToken: 'A001', bookingId: 'ti-bk-b' }],
+    ] as [string, Record<string, unknown>][]) {
+      const res = await authSend(path, adminA, 'POST', { ...body, ...extra });
+      expect([403, 404]).toContain(res.status);
+    }
+
+    // the queue is byte-for-byte what it was — no partial mutation slipped through
+    expect(await queue.listWithScores(sessionB)).toEqual(before);
+    const bkB = await prisma.booking.findUniqueOrThrow({ where: { id: 'ti-bk-b' } });
+    expect(bkB.status).toBe(BookingStatus.COMPLETED); // never flipped to NO_SHOW
+  });
+
+  it('a DOCTOR cannot drive another doctor\'s queue, even in the same hospital', async () => {
+    // Same clinic as doctorA, so hospital/clinic scoping alone would let this
+    // through — ownership has to be checked too.
+    await prisma.doctor.create({
+      data: { id: 'ti-doc-a2', clinicId: CLINIC_A, name: 'Dr A2', avgConsultMinutes: 5 },
+    });
+    try {
+      const res = await authSend('/queue/done', doctorA, 'POST', {
+        doctorId: 'ti-doc-a2', sessionDate: DATE, sessionType: 'MORNING',
+      });
+      expect([403, 404]).toContain(res.status);
+    } finally {
+      await prisma.doctor.delete({ where: { id: 'ti-doc-a2' } });
+    }
   });
 
   // ── Socket.io isolation ──────────────────────────────────────────────────

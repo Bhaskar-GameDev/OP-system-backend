@@ -147,13 +147,24 @@ describe('Payment failure webhook + pending-payment cleanup (real Redis + Postgr
     const { bookingId, orderId } = await initiate();
     const paymentId = `pay_ok_${paySeq++}`;
     rp.setCaptured(orderId, paymentId, FEE * 100);
-    await payments.confirm(orderId, paymentId); // booking -> BOOKED, payment -> SUCCESS
+    await payments.confirm(orderId, paymentId); // -> BOOKED, or ACTIVE if front of queue
+
+    // Snapshot the post-confirm state instead of asserting a literal status.
+    // confirm() enqueues, and an enqueue that lands at rank 0 is promoted
+    // straight to ACTIVE — so whether this booking is BOOKED or ACTIVE depends
+    // on whether anyone else is already queued for this doctor/session. Pinning
+    // it to BOOKED made the test pass only while stale queue entries from an
+    // earlier run happened to sit in front of it, and fail on a clean Redis.
+    // The invariant under test is that payment.failed changes NOTHING here.
+    const confirmed = await prisma.booking.findUniqueOrThrow({ where: { id: bookingId } });
+    expect([BookingStatus.BOOKED, BookingStatus.ACTIVE]).toContain(confirmed.status);
 
     const wh = failedWebhook(orderId, paymentId);
     await payments.handleWebhook(wh.raw, wh.sig); // should be a no-op (returns 200)
 
     const booking = await prisma.booking.findUniqueOrThrow({ where: { id: bookingId } });
-    expect(booking.status).toBe(BookingStatus.BOOKED);
+    expect(booking.status).toBe(confirmed.status); // unchanged by the webhook
+    expect(booking.tokenNumber).toBe(confirmed.tokenNumber);
     expect(booking.tokenNumber).toBeTruthy();
     const payment = await prisma.payment.findFirstOrThrow({ where: { bookingId } });
     expect(payment.status).toBe(PaymentStatus.SUCCESS);

@@ -11,11 +11,11 @@ import {
   Req,
   UseGuards,
 } from '@nestjs/common';
-import type { SessionType } from '@prisma/client';
 import { AuthedRequest, JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { RolesGuard } from '../auth/roles.guard';
 import { Roles } from '../auth/roles.decorator';
 import { ReceptionService } from './reception.service';
+import { DAILY_SESSION_TYPE } from '../common/session/daily-session';
 import { CheckInInput, RegisterWalkInInput } from './reception.dto';
 
 /**
@@ -36,7 +36,11 @@ export class ReceptionController {
 
   /**
    * POST /reception/walkins — register a walk-in patient.
-   * body: { mobile, name, doctorId, sessionDate: 'YYYY-MM-DD', sessionType }
+   * body: { mobile, name, doctorId, sessionDate: 'YYYY-MM-DD' }
+   *
+   * sessionType is no longer an input — a doctor sits one session per day, so
+   * it is pinned. Anything the caller sends is ignored rather than rejected so
+   * older reception clients keep working.
    */
   @Post('walkins')
   registerWalkIn(@Req() req: AuthedRequest, @Body() body: RegisterWalkInInput) {
@@ -45,13 +49,8 @@ export class ReceptionController {
     if (!mobile || !name) {
       throw new BadRequestException('mobile and name are required');
     }
-    if (!body?.doctorId || !body?.sessionDate || !body?.sessionType) {
-      throw new BadRequestException(
-        'doctorId, sessionDate, sessionType are required',
-      );
-    }
-    if (body.sessionType !== 'MORNING' && body.sessionType !== 'EVENING') {
-      throw new BadRequestException('sessionType must be MORNING or EVENING');
+    if (!body?.doctorId || !body?.sessionDate) {
+      throw new BadRequestException('doctorId and sessionDate are required');
     }
     if (!/^\d{4}-\d{2}-\d{2}$/.test(body.sessionDate)) {
       throw new BadRequestException('sessionDate must be YYYY-MM-DD');
@@ -60,27 +59,23 @@ export class ReceptionController {
       ...body,
       mobile,
       name,
+      sessionType: DAILY_SESSION_TYPE,
     });
   }
 
   /**
-   * GET /reception/bookings?doctorId&sessionDate&sessionType — check-in roster
-   * for a session: real bookings with patient name, status, and arrival flag.
+   * GET /reception/bookings?doctorId&sessionDate — check-in roster for the day:
+   * real bookings with patient name, status, and arrival flag. A sessionType
+   * query param is accepted but ignored (one session per day).
    */
   @Get('bookings')
   listBookings(
     @Req() req: AuthedRequest,
     @Query('doctorId') doctorId: string,
     @Query('sessionDate') sessionDate: string,
-    @Query('sessionType') sessionType: string,
   ) {
-    if (!doctorId || !sessionDate || !sessionType) {
-      throw new BadRequestException(
-        'doctorId, sessionDate, sessionType are required',
-      );
-    }
-    if (sessionType !== 'MORNING' && sessionType !== 'EVENING') {
-      throw new BadRequestException('sessionType must be MORNING or EVENING');
+    if (!doctorId || !sessionDate) {
+      throw new BadRequestException('doctorId and sessionDate are required');
     }
     if (!/^\d{4}-\d{2}-\d{2}$/.test(sessionDate)) {
       throw new BadRequestException('sessionDate must be YYYY-MM-DD');
@@ -88,7 +83,7 @@ export class ReceptionController {
     return this.reception.listBookings(clinicId(req), {
       doctorId,
       sessionDate,
-      sessionType: sessionType as SessionType,
+      sessionType: DAILY_SESSION_TYPE,
     });
   }
 

@@ -52,6 +52,11 @@ services:
       OTP_EXPIRY_SECONDS: 300
       # Allow local desktop/web clients to call the containerised API.
       CORS_ORIGINS: "http://localhost:1420,http://tauri.localhost,https://tauri.localhost,http://localhost:19006,http://localhost:8081"
+      # Shared secret for the server-to-server /voice/* API. MUST match the voice
+      # agent's VOICE_INTERNAL_SECRET (same variable name on both sides). The
+      # guard fails closed: unset here means every /voice/* call 401s, so the
+      # phone-booking demo silently does nothing. Demo value — rotate for real use.
+      VOICE_INTERNAL_SECRET: demo_only_voice_secret_change_me
       # External integrations unset -> dev fallbacks (OTP logged to backend
       # logs, fake payments auto-confirm, push logged). See SETUP.md for real keys.
     ports:

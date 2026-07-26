@@ -73,9 +73,13 @@ export interface QueuePosition {
  *
  * KEYS[1] token counter (A or W)   KEYS[2] shared arrival seq   KEYS[3] queue zset
  * ARGV[1] prefix ("A"/"W")         ARGV[2] zero-pad width
+ * ARGV[4] counter baseline ('' = none) — see BASELINE_LUA note below
  * returns { tokenSeq, arrivalScore, tokenNumber }
  */
 const ENQUEUE_LUA = `
+if ARGV[4] ~= '' and redis.call('EXISTS', KEYS[1]) == 0 then
+  redis.call('SET', KEYS[1], ARGV[4])
+end
 local tokenSeq = redis.call('INCR', KEYS[1])
 local score = redis.call('INCR', KEYS[2])
 local token = ARGV[1] .. string.format('%0' .. ARGV[2] .. 'd', tokenSeq)
@@ -84,6 +88,24 @@ if ARGV[3] ~= '' then redis.call('HSET', KEYS[4], token, ARGV[3]) end
 local card = redis.call('ZCARD', KEYS[3])
 return { tokenSeq, score, token, card }
 `;
+
+/**
+ * Why the counter needs a baseline.
+ *
+ * Token numbers are issued by a Redis INCR, but the uniqueness they must
+ * satisfy is a Postgres index: (doctor_id, session_date, session_type,
+ * token_number). Redis is volatile — a restart without persistence, a
+ * `docker compose down -v`, or a seeded database paired with a fresh Redis all
+ * leave the counter at 0 while Postgres already holds A001..A00n for that
+ * session. The next INCR then re-issues a token that already exists and the
+ * booking write dies on a unique-constraint violation (surfacing to the patient
+ * as "payment verification failed").
+ *
+ * The caller passes the session's DB high-water mark; the script adopts it only
+ * when the counter is absent. Doing it inside the script (rather than an
+ * EXISTS/SET round-trip in application code) keeps the seed-then-INCR atomic, so
+ * two concurrent cold-start callers can never both take the same number.
+ */
 
 /**
  * Atomic DONE: check-and-pop the front of the queue.
@@ -176,6 +198,9 @@ else
   if score <= activeScore or score >= upper then return { 'PRECISION' } end
 end
 -- token only issued AFTER the guard passes (no wasted token number on reject)
+if ARGV[4] ~= '' and redis.call('EXISTS', KEYS[1]) == 0 then
+  redis.call('SET', KEYS[1], ARGV[4])
+end
 local tokenSeq = redis.call('INCR', KEYS[1])
 local token = ARGV[1] .. string.format('%0' .. ARGV[2] .. 'd', tokenSeq)
 redis.call('ZADD', KEYS[3], score, token)
@@ -266,6 +291,7 @@ export class QueueService {
     source: TokenSource,
     session: SessionKey,
     bookingId = '',
+    tokenBaseline = 0,
   ): Promise<QueueEntry> {
     this.ensureCommand();
 
@@ -281,6 +307,7 @@ export class QueueService {
           prefix: string,
           pad: string,
           bookingId: string,
+          tokenBaseline: string,
         ) => Promise<[number, number, string, number]>;
       }
     ).pfosEnqueue.bind(this.redisService.redis);
@@ -293,6 +320,7 @@ export class QueueService {
       tokenPrefix(source),
       String(TOKEN_PAD),
       bookingId,
+      tokenBaseline > 0 ? String(tokenBaseline) : '',
     );
 
     return {
@@ -375,6 +403,7 @@ export class QueueService {
     source: TokenSource,
     session: SessionKey,
     bookingId = '',
+    tokenBaseline = 0,
   ): Promise<PriorityInsertOutcome> {
     this.ensureCommand();
     const run = (
@@ -387,6 +416,7 @@ export class QueueService {
           prefix: string,
           pad: string,
           bookingId: string,
+          tokenBaseline: string,
         ) => Promise<string[]>;
       }
     ).pfosPriority.bind(this.redisService.redis);
@@ -399,6 +429,7 @@ export class QueueService {
       tokenPrefix(source),
       String(TOKEN_PAD),
       bookingId,
+      tokenBaseline > 0 ? String(tokenBaseline) : '',
     );
     if (res[0] === 'PRECISION') return { status: 'PRECISION' };
     return {
