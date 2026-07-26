@@ -54,6 +54,11 @@ export class ProjectionService {
       case DomainEventType.NoShowMarked:
         await this.setStatus(encounterId, EncounterStatus.NO_SHOW);
         break;
+      case DomainEventType.EncounterCancelled:
+        // Leaves the WAITING set → drops off the doctor/reception frontends and
+        // patientTracking, matching the encounter's removal from the live line.
+        await this.setStatus(encounterId, EncounterStatus.CANCELLED);
+        break;
       case DomainEventType.EncounterTransferred:
         await this.setStatus(encounterId, EncounterStatus.TRANSFERRED);
         break;

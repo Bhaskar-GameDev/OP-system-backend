@@ -267,6 +267,37 @@ export class ConsultationEngineService {
     );
   }
 
+  /**
+   * Cancel an encounter before it is seen (patient / channel initiated, e.g. a
+   * phone caller cancelling their token). Legal from any pre-consultation state
+   * (the state machine rejects CALLED-into-consult / completed). If the encounter
+   * had reached the live line it is pulled from Redis first so it vanishes from
+   * the queue read models; a pre-queue cancel (no token/entry yet) just flips the
+   * status. Idempotent-friendly for best-effort callers: an already-cancelled or
+   * mid/post-consult encounter throws (illegal transition) for the caller to
+   * swallow.
+   */
+  async cancel(
+    encounterId: string,
+    opts: { actorId?: string } = {},
+  ): Promise<Encounter> {
+    const enc = await this.mustGet(encounterId);
+    const next = this.sm.nextEncounter(enc.status, 'CANCEL');
+    // Only encounters that actually reached the line have a queue entry to pull.
+    const entry = await this.prisma.queueEntry.findUnique({ where: { encounterId } });
+    if (entry) {
+      const category = await this.categoryOf(enc);
+      await this.queue.dequeue(entry.opSessionId, encounterId, category);
+    }
+    return this.applyEncounterEvent(
+      enc,
+      next,
+      DomainEventType.EncounterCancelled,
+      {},
+      opts.actorId,
+    );
+  }
+
   /** Doctor pause — stop calling (§9). Delegates to the session. */
   async pauseSession(opSessionId: string) {
     return this.sessions.pause(opSessionId);

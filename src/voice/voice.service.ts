@@ -17,14 +17,14 @@ import {
 } from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { SessionResolverService } from '../bookings/session-resolver.service';
-import { ConsultationService } from '../queue-engine/consultation.service';
-import { EtaService } from '../queue-engine/eta.service';
 import { QueueService } from '../queue-engine/queue.service';
 import { AuditService } from '../queue-engine/audit.service';
 import { PaymentsService } from '../payments/payments.service';
 import { OpMirrorService } from '../op-mirror/op-mirror.service';
+import { ConsultationEngineService } from '../consultation/consultation-engine.service';
+import { QueueReadService } from '../read-side/queue-read.service';
 import { OpConfigService } from '../config-engine/op-config.service';
-import { SessionKey, TokenSource } from '../queue-engine/token.service';
+import { SessionKey } from '../queue-engine/token.service';
 import { SessionClaims } from '../auth/auth-token.service';
 import { SMS_SENDER, SmsSender } from '../auth/sms.sender';
 import {
@@ -62,12 +62,12 @@ export class VoiceService {
     @Inject(SMS_SENDER) private readonly sms: SmsSender,
     private readonly prisma: PrismaService,
     private readonly resolver: SessionResolverService,
-    private readonly consult: ConsultationService,
     private readonly queue: QueueService,
-    private readonly eta: EtaService,
     private readonly audit: AuditService,
     private readonly payments: PaymentsService,
     private readonly mirror: OpMirrorService,
+    private readonly consultEngine: ConsultationEngineService,
+    private readonly queueRead: QueueReadService,
     private readonly config: OpConfigService,
   ) {}
 
@@ -180,7 +180,7 @@ export class VoiceService {
 
     const doctor = await this.prisma.doctor.findUnique({
       where: { id: req.doctorId },
-      select: { clinicId: true, name: true, consultationFee: true },
+      select: { clinicId: true, name: true, consultationFee: true, avgConsultMinutes: true },
     });
     if (!doctor) throw new NotFoundException('doctor not found');
     if (doctor.clinicId !== clinic.id) {
@@ -253,7 +253,31 @@ export class VoiceService {
       sessionDate: resolved.sessionDate,
       sessionType: resolved.sessionType,
     };
-    const entry = await this.consult.enqueueBooking(TokenSource.VOICE, session, booking.id);
+
+    // OP cutover: the token-based OP engine is now the source of truth for the
+    // token, so raise it there (register -> check-in -> issue token -> enqueue)
+    // instead of the legacy queue engine. `present: true` runs the same
+    // primitives the reception combined desk uses, and returns the issued OP
+    // token — the number the caller is told AND the number the OP read models
+    // (doctor / reception frontends) render. Idempotent on callSid.
+    const op = await this.mirror.mirror({
+      source: RegistrationSource.VOICE_AGENT,
+      doctorId: req.doctorId,
+      patientId: patient.id,
+      mobile: req.patientPhone,
+      name: req.patientName ?? undefined,
+      serviceDate: resolved.sessionDate,
+      idempotencyKey: req.callSid,
+      legacyBookingId: booking.id,
+      present: true,
+    });
+    if (!op?.token) {
+      // OP is authoritative now: with no token there is nothing to quote and
+      // nothing shows in the queue. Surface it so the agent re-offers rather than
+      // confirming a phantom, token-less booking.
+      throw new ConflictException('could not raise a token for this session');
+    }
+    const tokenNumber = op.token.displayNumber;
 
     // Unpaid Payment (status CREATED) = amount due at the desk; link it on.
     const payment = await this.prisma.payment.create({
@@ -264,9 +288,12 @@ export class VoiceService {
       },
       select: { id: true },
     });
+    // Mirror the OP token onto the legacy Booking so lookup/cancel still read a
+    // single, consistent number (the legacy row is kept only as the correlation
+    // record + refund/audit anchor; it no longer mints its own token).
     const updated = await this.prisma.booking.update({
       where: { id: booking.id },
-      data: { tokenNumber: entry.tokenNumber, paymentId: payment.id },
+      data: { tokenNumber, paymentId: payment.id },
       select: { id: true, tokenNumber: true, status: true },
     });
 
@@ -276,30 +303,16 @@ export class VoiceService {
     // issued and enqueued, so a provider outage must not undo a real booking.
     await this.sendBookingSms({
       mobile: req.patientPhone,
-      tokenNumber: updated.tokenNumber ?? entry.tokenNumber,
+      tokenNumber,
       doctorName: doctor.name,
       clinicName: clinic.name,
-      session,
-    });
-
-    // Dual-write to the new engine (Task 2). Register-only: the caller is not at
-    // the desk yet, so the token is issued later at reception check-in
-    // (registration ≠ token). Idempotent on callSid so a retried call maps to the
-    // same encounter. Best effort — never affects the real booking above.
-    await this.mirror.mirror({
-      source: RegistrationSource.VOICE_AGENT,
-      doctorId: req.doctorId,
-      patientId: patient.id,
-      mobile: req.patientPhone,
-      name: req.patientName ?? undefined,
-      serviceDate: resolved.sessionDate,
-      idempotencyKey: req.callSid,
-      legacyBookingId: updated.id,
+      encounterId: op.encounterId,
+      avgConsultMinutes: doctor.avgConsultMinutes,
     });
 
     return {
       bookingId: updated.id,
-      tokenNumber: updated.tokenNumber ?? entry.tokenNumber,
+      tokenNumber,
       doctorId: req.doctorId,
       doctorName: doctor.name,
       sessionDate: resolved.sessionDate,
@@ -356,24 +369,25 @@ export class VoiceService {
     tokenNumber: string;
     doctorName: string;
     clinicName: string;
-    session: SessionKey;
+    encounterId: string;
+    avgConsultMinutes: number;
   }): Promise<void> {
     try {
-      const ahead = Math.max(0, (await this.queue.size(args.session)) - 1);
-      const doctor = await this.prisma.doctor.findUnique({
-        where: { id: args.session.doctorId },
-        select: { avgConsultMinutes: true },
-      });
-      const waitMinutes = ahead * (doctor?.avgConsultMinutes ?? 10);
-
-      const wait =
-        ahead === 0
-          ? 'You are next.'
-          : `${ahead} ahead of you, about ${waitMinutes} minutes.`;
+      // Position comes from the OP read model now (same source the frontends and
+      // queue-status read). It is a projection, so it can briefly lag the enqueue
+      // — if so we simply omit the wait sentence rather than quote a wrong one.
+      const tracking = await this.queueRead.patientTracking(args.encounterId);
+      let wait = '';
+      if (tracking) {
+        wait =
+          tracking.ahead === 0
+            ? ' You are next.'
+            : ` ${tracking.ahead} ahead of you, about ${tracking.ahead * args.avgConsultMinutes} minutes.`;
+      }
 
       await this.sms.sendText(
         args.mobile,
-        `Your token is ${args.tokenNumber} for ${args.doctorName} at ${args.clinicName}. ${wait} Please pay at the reception desk on arrival.`,
+        `Your token is ${args.tokenNumber} for ${args.doctorName} at ${args.clinicName}.${wait} Please pay at the reception desk on arrival.`,
       );
     } catch (err) {
       this.logger.error(
@@ -414,42 +428,55 @@ export class VoiceService {
         doctorId: true,
         sessionDate: true,
         sessionType: true,
-        doctor: { select: { name: true, specialization: true } },
+        doctor: { select: { name: true, specialization: true, avgConsultMinutes: true } },
       },
       orderBy: { sessionDate: 'asc' },
     });
 
     const out: VoiceQueueStatusRecord[] = [];
     for (const b of bookings) {
-      const token = b.tokenNumber;
-      if (!token) continue;
-
-      const session: SessionKey = {
-        doctorId: b.doctorId,
-        sessionDate: ymd(b.sessionDate),
-        sessionType: b.sessionType,
-      };
-      const [eta, serving] = await Promise.all([
-        this.eta.etaFor(token, session),
-        this.queue.frontToken(session),
-      ]);
-      // No ETA means the token has left the live queue (completed / no-show /
-      // session cleared) even though the row still reads BOOKED — skip it rather
-      // than read out a stale position.
-      if (!eta) continue;
+      // OP cutover: position/ETA come from the OP read model now, not the legacy
+      // queue. A voice booking's legacy row links to its OP encounter via the
+      // backfill column OR the mirror channelMeta; read that encounter's live
+      // tracking.
+      const encounterId = await this.resolveEncounterId(b.id);
+      if (!encounterId) continue;
+      const tracking = await this.queueRead.patientTracking(encounterId);
+      // No tracking / no order key means the token has left the live queue
+      // (called / completed / no-show) — skip it rather than read a stale spot.
+      if (!tracking || tracking.tokenNumber == null) continue;
 
       out.push({
         bookingId: b.id,
-        tokenNumber: token,
+        tokenNumber: tracking.tokenNumber,
         doctorName: b.doctor.name,
         specialization: b.doctor.specialization,
         sessionType: b.sessionType,
-        patientsAhead: eta.patientsAhead,
-        estimatedWaitMinutes: eta.etaMinutes,
-        currentlyServing: serving,
+        patientsAhead: tracking.ahead,
+        estimatedWaitMinutes: tracking.ahead * b.doctor.avgConsultMinutes,
+        currentlyServing: tracking.nowServingToken,
       });
     }
     return out;
+  }
+
+  /**
+   * legacy bookingId -> OP encounterId. A backfilled booking carries the link on
+   * Encounter.legacyBookingId; a mirror-created one (voice/app) carries it in
+   * Registration.channelMeta.legacyBookingId. Check both — a freshly voice-booked
+   * caller only has the channelMeta link, so resolving by column alone misses them.
+   */
+  private async resolveEncounterId(bookingId: string): Promise<string | null> {
+    const byColumn = await this.prisma.encounter.findUnique({
+      where: { legacyBookingId: bookingId },
+      select: { id: true },
+    });
+    if (byColumn) return byColumn.id;
+    const reg = await this.prisma.registration.findFirst({
+      where: { channelMeta: { path: ['legacyBookingId'], equals: bookingId } },
+      select: { encounterId: true },
+    });
+    return reg?.encounterId ?? null;
   }
 
   // ── cancel ────────────────────────────────────────────────────────────────
@@ -467,6 +494,23 @@ export class VoiceService {
     // Race-safe status flip + queue removal + refund-if-paid (pay-at-desk has no
     // captured payment, so this just cancels). Status gate is inside cancelBooking.
     await this.payments.cancelBooking(appointmentId, { reason: 'cancelled by phone' });
+
+    // OP cutover: the token the caller holds lives in the OP engine (raised at
+    // booking), so cancel the linked OP encounter too — pull it from the line so
+    // it disappears from the doctor/reception frontends and queue-status. Best
+    // effort: the legacy cancel above already succeeded, and the encounter may be
+    // in a state CANCEL is illegal from (already called / cancelled) — never fail
+    // the caller's cancel over it.
+    const encounterId = await this.resolveEncounterId(booking.id);
+    if (encounterId) {
+      try {
+        await this.consultEngine.cancel(encounterId, { actorId: booking.patientId });
+      } catch (err) {
+        this.logger.warn(
+          `OP encounter cancel skipped for booking ${booking.id}: ${(err as Error).message}`,
+        );
+      }
+    }
 
     // Compliance trail, attributed to the voice channel.
     const actor: SessionClaims = {

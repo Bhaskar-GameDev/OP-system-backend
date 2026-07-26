@@ -3,6 +3,7 @@ import { CheckInMethod, RegistrationSource } from '@prisma/client';
 import { EncounterService } from '../encounters/encounter.service';
 import { CheckInService } from '../check-in/checkin.service';
 import { OpQueueService } from '../queue/op-queue.service';
+import { IssuedToken } from '../tokens/token-series.service';
 
 export interface MirrorInput {
   source: RegistrationSource;
@@ -50,7 +51,9 @@ export class OpMirrorService {
     private readonly queue: OpQueueService,
   ) {}
 
-  async mirror(input: MirrorInput): Promise<{ encounterId: string } | null> {
+  async mirror(
+    input: MirrorInput,
+  ): Promise<{ encounterId: string; token?: IssuedToken } | null> {
     try {
       const encounter = await this.encounters.register({
         source: input.source,
@@ -67,11 +70,14 @@ export class OpMirrorService {
       });
 
       if (input.present) {
-        await this.checkIn.checkIn(encounter.id, CheckInMethod.AUTO, {
+        const ci = await this.checkIn.checkIn(encounter.id, CheckInMethod.AUTO, {
           checkedInBy: input.actorId,
           issueToken: true,
         });
         await this.queue.enqueue(encounter.id);
+        // The issued OP token is the number the caller is told and the frontend
+        // shows — surface it so the channel (voice) can raise + read it back.
+        return { encounterId: encounter.id, token: ci.token };
       }
 
       return { encounterId: encounter.id };
