@@ -1,12 +1,10 @@
 import {
   IsEnum,
-  IsInt,
   IsISO8601,
   IsOptional,
   IsString,
   Length,
   Matches,
-  Min,
 } from 'class-validator';
 import { RegistrationReason, RegistrationSource } from '@prisma/client';
 

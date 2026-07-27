@@ -122,7 +122,6 @@ describe('Integration — full real chain (Redis + Postgres + WS)', () => {
   const MOBILE_A = '9100000001';
   let patientA = '';
   let patientAToken = '';
-  let doctorToken = '';
   const extraPatients: string[] = [];
 
   beforeAll(async () => {
@@ -180,7 +179,9 @@ describe('Integration — full real chain (Redis + Postgres + WS)', () => {
     patientA = a.sub;
     await prisma.patient.update({ where: { id: patientA }, data: { fcmToken: 'fcm-A' } });
 
-    doctorToken = (await auth.doctorLogin('dr.e2e', 'docpass')).token;
+    // Logs in to prove the doctor credentials seeded above work; this suite
+    // drives the doctor over the socket, so the token itself is not needed.
+    await auth.doctorLogin('dr.e2e', 'docpass');
   });
 
   afterAll(async () => {
@@ -212,7 +213,7 @@ describe('Integration — full real chain (Redis + Postgres + WS)', () => {
 
   /** initiate + pay an APP booking for a patient -> returns issued token. */
   async function payApp(patientId: string): Promise<string> {
-    const { bookingId, orderId, amount } = await payments.initiateBooking({
+    const { orderId, amount } = await payments.initiateBooking({
       patientId, doctorId: DOCTOR_ID, source: BookingSource.APP,
     });
     const paymentId = `pay_${orderId}`;

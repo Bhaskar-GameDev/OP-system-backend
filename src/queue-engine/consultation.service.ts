@@ -103,7 +103,6 @@ export class ConsultationService {
     const redis = this.redisService.redis;
 
     const deadline = Date.now() + LOCK_WAIT_MS;
-    // eslint-disable-next-line no-constant-condition
     while (true) {
       const ok = await redis.set(key, owner, 'PX', LOCK_TTL_MS, 'NX');
       if (ok === 'OK') break;

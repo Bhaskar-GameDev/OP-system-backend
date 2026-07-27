@@ -262,7 +262,6 @@ describe('Queue Engine — multi-session load test (real Redis + Postgres)', () 
     const enqThroughput = (enqueuePlan.length / enqWall) * 1000;
     const stormThroughput = (ops.length / stormWall) * 1000;
 
-    // eslint-disable-next-line no-console
     console.log(
       [
         '',
