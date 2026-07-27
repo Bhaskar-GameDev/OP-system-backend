@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+# A newer push to the same branch makes the in-flight run pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # The suite runs against REAL Postgres + Redis, not mocks — token allocation
+    # is a Redis INCR and the concurrency specs assert genuine row contention, so
+    # a fake would prove nothing. Ports mirror docker-compose.yml (5433 on the
+    # host, because a local Windows Postgres usually owns 5432).
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pfos
+          POSTGRES_PASSWORD: pfos_local_pw
+          POSTGRES_DB: patient_flow_os
+        ports: ['5433:5432']
+        options: >-
+          --health-cmd "pg_isready -U pfos -d patient_flow_os"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://pfos:pfos_local_pw@localhost:5433/patient_flow_os?schema=public
+      REDIS_HOST: localhost
+      REDIS_PORT: 6379
+      NODE_ENV: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - run: npx prisma generate
+
+      # `migrate deploy`, not `migrate dev`: it applies the committed migrations
+      # and fails on drift instead of inventing a new one.
+      - run: npx prisma migrate deploy
+
+      - name: Lint
+        run: npm run lint:ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit -p tsconfig.json
+
+      # Serial: the suites share one database and the Redis token counters, so
+      # parallel workers would collide on both.
+      - name: Test
+        run: npm test -- --runInBand
+
+      - name: Build
+        run: npm run build
