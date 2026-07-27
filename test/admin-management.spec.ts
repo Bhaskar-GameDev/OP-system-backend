@@ -61,7 +61,12 @@ describe('Admin management (clinics / doctors / sessions)', () => {
     await prisma.doctorSession.deleteMany({ where: { doctor: { clinicId: { in: ids } } } });
     await prisma.doctor.deleteMany({ where: { clinicId: { in: ids } } });
     await prisma.staff.deleteMany({ where: { clinicId: { in: ids } } });
+    await prisma.tokenSeries.deleteMany({ where: { clinicId: { in: ids } } });
     await prisma.clinic.deleteMany({ where: { id: { in: ids } } });
+    // Onboarding ships a default series with every clinic, so any left over from
+    // a failed run has to go before its clinic can be deleted.
+    const strays = await prisma.clinic.findMany({ where: { hospitalId: HOSPITAL }, select: { id: true } });
+    await prisma.tokenSeries.deleteMany({ where: { clinicId: { in: strays.map((c) => c.id) } } });
     await prisma.clinic.deleteMany({ where: { hospitalId: HOSPITAL } });
     await prisma.hospital.deleteMany({ where: { id: HOSPITAL } });
   }
@@ -94,6 +99,14 @@ describe('Admin management (clinics / doctors / sessions)', () => {
 
     const list = (await (await adminFetch('/admin/clinics')).json()) as { id: string }[];
     expect(list.some((c) => c.id === created.id)).toBe(true);
+
+    // A clinic with no TokenSeries cannot register a single patient — the OP
+    // engine resolves the encounter's category from it — so onboarding has to
+    // ship the default, not leave the first booking to fail.
+    const series = await prisma.tokenSeries.findMany({ where: { clinicId: created.id } });
+    expect(series).toHaveLength(1);
+    expect(series[0].code).toBe('NORMAL_OP');
+    expect(series[0].active).toBe(true);
   });
 
   it('doctor: stores photoUrl and rejects non-positive fee', async () => {

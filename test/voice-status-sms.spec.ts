@@ -4,13 +4,18 @@ process.env.VOICE_INTERNAL_SECRET = 'test-voice-secret';
 import { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { AddressInfo } from 'node:net';
-import { SessionType } from '@prisma/client';
+import { CheckInMethod, RegistrationSource, SessionType } from '@prisma/client';
 import { AppModule } from '../src/app.module';
 import { PrismaService } from '../src/common/prisma/prisma.service';
+import { RedisService } from '../src/common/redis/redis.service';
 import { SMS_SENDER, SmsSender } from '../src/auth/sms.sender';
 import { QueueService } from '../src/queue-engine/queue.service';
-import { ConsultationService } from '../src/queue-engine/consultation.service';
-import { SessionKey, TokenSource } from '../src/queue-engine/token.service';
+import { SessionKey } from '../src/queue-engine/token.service';
+import { EncounterService } from '../src/encounters/encounter.service';
+import { CheckInService } from '../src/check-in/checkin.service';
+import { OpQueueService } from '../src/queue/op-queue.service';
+import { ConsultationEngineService } from '../src/consultation/consultation-engine.service';
+import { ProjectionRunner } from '../src/read-side/projection-runner.service';
 import { VoiceQueueStatusRecord } from '../src/voice/voice.dto';
 
 /** Captures SMS instead of sending, and can be made to fail on demand. */
@@ -45,9 +50,18 @@ describe('Voice queue-status + booking SMS (real infra)', () => {
   let app: INestApplication;
   let url: string;
   let prisma: PrismaService;
+  let redis: RedisService;
   let queue: QueueService;
-  let consult: ConsultationService;
+  let encounters: EncounterService;
+  let checkIn: CheckInService;
+  let opQueue: OpQueueService;
+  let engine: ConsultationEngineService;
+  let projection: ProjectionRunner;
   const sms = new FakeSms();
+
+  /** Clinic A's OP line + the walk-in filler holding W001 on it. */
+  let opSessionA = '';
+  let fillerEncounterId = '';
 
   const SECRET = 'test-voice-secret';
   const HOSP = 'vs-hosp';
@@ -60,6 +74,11 @@ describe('Voice queue-status + booking SMS (real infra)', () => {
   const CALLER = '9300009101';
   const FILLER = '9300009102';
   const STRANGER = '9300009103';
+  // OP categories. Clinic A runs two so the walk-in filler keeps its own W
+  // series and the voice caller still reads A001 off the clinic default.
+  const SERIES_A = 'vs-series-a';
+  const SERIES_A_WALKIN = 'vs-series-a-walkin';
+  const SERIES_B = 'vs-series-b';
 
   let sessionA: SessionKey;
   let sessionB: SessionKey;
@@ -78,8 +97,13 @@ describe('Voice queue-status + booking SMS (real infra)', () => {
     await app.listen(0);
     url = `http://127.0.0.1:${(app.getHttpServer().address() as AddressInfo).port}`;
     prisma = app.get(PrismaService);
+    redis = app.get(RedisService);
     queue = app.get(QueueService);
-    consult = app.get(ConsultationService);
+    encounters = app.get(EncounterService);
+    checkIn = app.get(CheckInService);
+    opQueue = app.get(OpQueueService);
+    engine = app.get(ConsultationEngineService);
+    projection = app.get(ProjectionRunner);
 
     sessionA = { doctorId: DOC_A, sessionDate: todayYmd(), sessionType: 'MORNING' };
     sessionB = { doctorId: DOC_B, sessionDate: todayYmd(), sessionType: 'MORNING' };
@@ -114,6 +138,16 @@ describe('Voice queue-status + booking SMS (real infra)', () => {
         daysOfWeek: [0, 1, 2, 3, 4, 5, 6],
       })),
     });
+    // The OP engine renders every token from a TokenSeries and refuses to
+    // register without one, so both clinics need a default. NORMAL_OP is the
+    // one voice bookings fall back to; the W series is only for the filler.
+    await prisma.tokenSeries.createMany({
+      data: [
+        { id: SERIES_A, clinicId: CLINIC_A, code: 'NORMAL_OP', label: 'Normal OP', prefix: 'A', padWidth: 3, startAt: 1 },
+        { id: SERIES_A_WALKIN, clinicId: CLINIC_A, code: 'WALK_IN', label: 'Walk-in', prefix: 'W', padWidth: 3, startAt: 1 },
+        { id: SERIES_B, clinicId: CLINIC_B, code: 'NORMAL_OP', label: 'Normal OP', prefix: 'B', padWidth: 3, startAt: 1 },
+      ],
+    });
   });
 
   afterAll(async () => {
@@ -121,9 +155,41 @@ describe('Voice queue-status + booking SMS (real infra)', () => {
     await app.close();
   });
 
+  /** Encounter ids the OP engine holds for either doctor in this fixture. */
+  async function opEncounterIds(): Promise<string[]> {
+    const rows = await prisma.encounter
+      .findMany({ where: { doctorId: { in: [DOC_A, DOC_B] } }, select: { id: true } })
+      .catch(() => [] as { id: string }[]);
+    return rows.map((r) => r.id);
+  }
+
   async function cleanup(): Promise<void> {
     await queue.clearSession(sessionA);
     await queue.clearSession(sessionB);
+    // OP side owns the tokens and the live line now; clear its rows and the
+    // Redis token counters, or a rerun starts counting at A002 / W002.
+    const eids = await opEncounterIds();
+    await prisma.consultation.deleteMany({ where: { encounterId: { in: eids } } }).catch(() => undefined);
+    await prisma.queueEntry.deleteMany({ where: { encounterId: { in: eids } } }).catch(() => undefined);
+    await prisma.token.deleteMany({ where: { encounterId: { in: eids } } }).catch(() => undefined);
+    await prisma.checkIn.deleteMany({ where: { encounterId: { in: eids } } }).catch(() => undefined);
+    await prisma.registration.deleteMany({ where: { encounterId: { in: eids } } }).catch(() => undefined);
+    await prisma.queueReadModel.deleteMany({ where: { encounterId: { in: eids } } }).catch(() => undefined);
+    await prisma.domainEvent.deleteMany({ where: { streamId: { in: eids } } }).catch(() => undefined);
+    await prisma.encounter.deleteMany({ where: { id: { in: eids } } }).catch(() => undefined);
+    await prisma.opSession.deleteMany({ where: { doctorId: { in: [DOC_A, DOC_B] } } }).catch(() => undefined);
+    // PER_SESSION counter keys — see TokenSeriesService.counterKey.
+    const day = todayYmd();
+    for (const [series, doctorId] of [
+      [SERIES_A, DOC_A],
+      [SERIES_A_WALKIN, DOC_A],
+      [SERIES_B, DOC_B],
+    ]) {
+      await redis.redis.del(`pfos:tokenseq:${series}:${doctorId}:${day}`).catch(() => undefined);
+    }
+    await prisma.tokenSeries
+      .deleteMany({ where: { id: { in: [SERIES_A, SERIES_A_WALKIN, SERIES_B] } } })
+      .catch(() => undefined);
     await prisma.voiceCallLog.deleteMany({ where: { didNumber: { in: [DID_A, DID_B] } } });
     const bookings = await prisma.booking.findMany({
       where: { doctorId: { in: [DOC_A, DOC_B] } },
@@ -151,31 +217,33 @@ describe('Voice queue-status + booking SMS (real infra)', () => {
       body: JSON.stringify(body),
     });
 
-  const status = (did: string, phone: string) =>
-    post('/voice/queue-status', { didNumber: did, patientPhone: phone });
+  // queue-status reads the CQRS read model, which the scheduler drains on a 2s
+  // tick. Pull that forward instead of sleeping, so the assertions see the line
+  // as it stands right now.
+  const status = async (did: string, phone: string) => {
+    await projection.runOnce();
+    return post('/voice/queue-status', { didNumber: did, patientPhone: phone });
+  };
 
   // ── booking confirmation SMS ───────────────────────────────────────────────
   describe('booking confirmation SMS', () => {
     beforeAll(async () => {
       sms.reset();
-      // A walk-in filler occupies rank 0, so the voice caller lands behind
-      // someone — the realistic case and the one where a wait is quoted.
-      const filler = await prisma.patient.create({
-        data: { mobile: FILLER, name: 'Filler' },
-        select: { id: true },
+      // A walk-in filler takes W001 first, so the voice caller lands behind
+      // someone — the realistic case and the one where a wait is quoted. It goes
+      // through the OP engine (register -> check in -> enqueue), the same
+      // primitives the reception desk uses and the line /voice/queue-status reads.
+      const fillerEnc = await encounters.register({
+        source: RegistrationSource.RECEPTION,
+        doctorId: DOC_A,
+        mobile: FILLER,
+        name: 'Filler',
+        serviceDate: todayYmd(),
+        opCategoryId: SERIES_A_WALKIN,
       });
-      const fillerBooking = await prisma.booking.create({
-        data: {
-          patientId: filler.id,
-          doctorId: DOC_A,
-          source: 'WALK_IN',
-          sessionDate: new Date(`${todayYmd()}T00:00:00.000Z`),
-          sessionType: SessionType.MORNING,
-          status: 'BOOKED',
-        },
-        select: { id: true },
-      });
-      await consult.enqueueBooking(TokenSource.WALK_IN, sessionA, fillerBooking.id);
+      fillerEncounterId = fillerEnc.id;
+      await checkIn.checkIn(fillerEnc.id, CheckInMethod.AUTO, { issueToken: true });
+      opSessionA = (await opQueue.enqueue(fillerEnc.id)).opSessionId;
 
       const res = await post('/voice/bookings', {
         didNumber: DID_A,
@@ -217,8 +285,13 @@ describe('Voice queue-status + booking SMS (real infra)', () => {
       const body = (await res.json()) as { tokenNumber: string };
       expect(body.tokenNumber).toBeTruthy();
 
-      // token really is in the live queue despite the SMS blowing up
-      expect(await queue.list(sessionA)).toContain(body.tokenNumber);
+      // token really is in the live OP line despite the SMS blowing up
+      const waiting = await opQueue.listWaiting(opSessionA);
+      const tokens = await prisma.token.findMany({
+        where: { encounterId: { in: waiting.map((w) => w.encounterId) } },
+        select: { displayNumber: true },
+      });
+      expect(tokens.map((t) => t.displayNumber)).toContain(body.tokenNumber);
     });
   });
 
@@ -234,18 +307,29 @@ describe('Voice queue-status + booking SMS (real infra)', () => {
       expect(r.tokenNumber).toBe('A001');
       expect(r.doctorName).toBe('Dr Aruna');
       expect(r.specialization).toBe('Cardiology');
-      expect(r.patientsAhead).toBe(1); // the walk-in filler
+      expect(r.patientsAhead).toBe(1); // the walk-in filler, still waiting
       expect(r.estimatedWaitMinutes).toBe(10); // 1 ahead x 10 min
-      expect(r.currentlyServing).toBe('W001'); // the filler at rank 0
+      expect(r.currentlyServing).toBeNull(); // nobody called into the room yet
     });
 
-    it('reflects the queue moving — position and wait drop after a DONE', async () => {
-      await consult.markDone(sessionA, 'W001');
+    it('reflects the queue moving — position and wait drop as the filler is seen', async () => {
+      // Filler is called and goes in: they leave the waiting line, so the
+      // caller's wait drops to zero and the board names who is inside.
+      const called = await engine.callNext(opSessionA);
+      expect(called?.encounter.id).toBe(fillerEncounterId);
+      await engine.startConsultation(fillerEncounterId);
 
-      const rows = (await status(DID_A, CALLER).then((r) => r.json())) as VoiceQueueStatusRecord[];
+      let rows = (await status(DID_A, CALLER).then((r) => r.json())) as VoiceQueueStatusRecord[];
       expect(rows[0].patientsAhead).toBe(0);
       expect(rows[0].estimatedWaitMinutes).toBe(0);
-      // now they are the one being served
+      expect(rows[0].currentlyServing).toBe('W001');
+
+      // Filler done, caller called in — now they are the one being served.
+      await engine.complete(fillerEncounterId);
+      const next = await engine.callNext(opSessionA);
+      await engine.startConsultation(next!.encounter.id);
+
+      rows = (await status(DID_A, CALLER).then((r) => r.json())) as VoiceQueueStatusRecord[];
       expect(rows[0].currentlyServing).toBe('A001');
     });
 

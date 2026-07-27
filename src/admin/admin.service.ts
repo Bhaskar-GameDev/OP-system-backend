@@ -142,15 +142,27 @@ export class AdminService {
     hospitalId: string,
     input: CreateClinicInput,
   ): Promise<AdminClinicView> {
-    const created = await this.prisma.clinic.create({
-      data: {
-        // hospitalId is taken from the TOKEN scope, never from the request body.
-        hospital: { connect: { id: hospitalId } },
-        name: req(input.name, 'name'),
-        address: input.address ?? null,
-        contactNumber: input.contactNumber ?? null,
-      },
-      select: CLINIC_SELECT,
+    const created = await this.prisma.$transaction(async (tx) => {
+      const clinic = await tx.clinic.create({
+        data: {
+          // hospitalId is taken from the TOKEN scope, never from the request body.
+          hospital: { connect: { id: hospitalId } },
+          name: req(input.name, 'name'),
+          address: input.address ?? null,
+          contactNumber: input.contactNumber ?? null,
+        },
+        select: CLINIC_SELECT,
+      });
+      // A clinic with no TokenSeries cannot register a single patient: the OP
+      // engine resolves the encounter's category from the clinic's series and
+      // throws when there is none, so every channel (reception, app, voice)
+      // fails at the first booking. Ship the same default the seed and the
+      // legacy backfill create, in the same transaction as the clinic so the
+      // pair can never exist half-made. Admins can edit or add series after.
+      await tx.tokenSeries.create({
+        data: { clinicId: clinic.id, code: 'NORMAL_OP', label: 'Normal OP', prefix: 'N' },
+      });
+      return clinic;
     });
     return toAdminClinic(created);
   }

@@ -5,20 +5,23 @@ import { Test } from '@nestjs/testing';
 import { EncounterStatus, SessionType, TokenResetPolicy } from '@prisma/client';
 import { AppModule } from '../src/app.module';
 import { PrismaService } from '../src/common/prisma/prisma.service';
-import { RedisService } from '../src/common/redis/redis.service';
 import { VoiceService } from '../src/voice/voice.service';
 import { QueueService } from '../src/queue-engine/queue.service';
 import { SessionKey } from '../src/queue-engine/token.service';
 
 /**
- * Task 2 dual-write — VOICE channel (voice.book). Proves a phone booking ALSO
- * mirrors into the new engine as a REGISTER-ONLY Encounter (source VOICE_AGENT),
- * idempotent on callSid, with the legacy pay-at-desk booking untouched.
+ * Dual-write — VOICE channel (voice.book). Proves a phone booking mirrors into
+ * the new engine as an Encounter (source VOICE_AGENT), idempotent on callSid,
+ * with the legacy pay-at-desk booking kept as the correlation record.
+ *
+ * Voice mirrors with `present: true`, unlike the app: a phone caller picks a
+ * doctor and is given a number on the call, so the OP engine issues the token
+ * and puts them in the line there and then. It is the OP token the agent reads
+ * out, so registering without one would leave nothing to say.
  */
 describe('Dual-write: voice.book mirrors a VOICE booking into the new engine', () => {
   let app: INestApplication;
   let prisma: PrismaService;
-  let redis: RedisService;
   let voice: VoiceService;
   let queue: QueueService;
 
@@ -43,7 +46,6 @@ describe('Dual-write: voice.book mirrors a VOICE booking into the new engine', (
     app = moduleRef.createNestApplication({ logger: false });
     await app.init();
     prisma = app.get(PrismaService);
-    redis = app.get(RedisService);
     voice = app.get(VoiceService);
     queue = app.get(QueueService);
     session = { doctorId: DOCTOR, sessionDate: todayYmd(), sessionType: 'MORNING' };
@@ -89,12 +91,12 @@ describe('Dual-write: voice.book mirrors a VOICE booking into the new engine', (
     await prisma.hospital.deleteMany({ where: { id: HOSP } }).catch(() => {});
   }
 
-  it('a VOICE booking yields a register-only mirrored Encounter (source VOICE_AGENT)', async () => {
+  it('a VOICE booking yields a mirrored Encounter holding the token it quoted (source VOICE_AGENT)', async () => {
     const res = await voice.book({
       didNumber: DID, doctorId: DOCTOR, sessionType: 'MORNING',
       patientPhone: PHONE, patientName: 'Voice Caller', callSid: CALLSID,
     });
-    expect(res.tokenNumber).toBeTruthy(); // legacy pay-at-desk token issued as before
+    expect(res.tokenNumber).toBeTruthy(); // the number read out to the caller
 
     const reg = await prisma.registration.findFirst({
       where: { source: 'VOICE_AGENT', channelMeta: { path: ['legacyBookingId'], equals: res.bookingId } },
@@ -103,11 +105,16 @@ describe('Dual-write: voice.book mirrors a VOICE booking into the new engine', (
     expect(reg).not.toBeNull();
     encounterIds.push(reg!.encounterId);
 
-    // REGISTER-ONLY: REGISTERED, no token, no queue entry (token comes at desk check-in)
+    // Checked in and in the line, holding the token the caller was told — the OP
+    // engine is the source of truth for that number, not the legacy booking.
     const enc = await prisma.encounter.findUniqueOrThrow({ where: { id: reg!.encounterId } });
-    expect(enc.status).toBe(EncounterStatus.REGISTERED);
-    expect(await prisma.token.findUnique({ where: { encounterId: reg!.encounterId } })).toBeNull();
-    expect(await prisma.queueEntry.findUnique({ where: { encounterId: reg!.encounterId } })).toBeNull();
+    expect(enc.status).toBe(EncounterStatus.WAITING);
+    const token = await prisma.token.findUnique({ where: { encounterId: reg!.encounterId } });
+    expect(token?.displayNumber).toBe(res.tokenNumber);
+    expect(await prisma.queueEntry.findUnique({ where: { encounterId: reg!.encounterId } })).not.toBeNull();
+    // The legacy row mirrors the same number, so lookup/cancel stay consistent.
+    const legacy = await prisma.booking.findUniqueOrThrow({ where: { id: res.bookingId } });
+    expect(legacy.tokenNumber).toBe(res.tokenNumber);
   });
 
   it('is idempotent on callSid — a retried call maps to the same Encounter', async () => {

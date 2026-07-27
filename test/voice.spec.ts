@@ -7,6 +7,7 @@ import { AddressInfo } from 'node:net';
 import { BookingStatus, PaymentStatus, SessionType } from '@prisma/client';
 import { AppModule } from '../src/app.module';
 import { PrismaService } from '../src/common/prisma/prisma.service';
+import { RedisService } from '../src/common/redis/redis.service';
 import { AuthTokenService } from '../src/auth/auth-token.service';
 import { QueueService } from '../src/queue-engine/queue.service';
 import { ConsultationService } from '../src/queue-engine/consultation.service';
@@ -23,12 +24,14 @@ describe('Voice API (/voice) — real infra', () => {
   let url: string;
   let prisma: PrismaService;
   let queue: QueueService;
+  let redis: RedisService;
 
   const SECRET = 'test-voice-secret';
   const HOSP = 'vc-hosp';
   const CLINIC = 'vc-clinic';
   const DID = '+910000000001';
   const DOCTOR = 'vc-doctor';
+  const SERIES = 'vc-series';
   const PHONE = '9300009001';
   const FILLER_PHONE = '9300009002';
 
@@ -47,6 +50,7 @@ describe('Voice API (/voice) — real infra', () => {
     url = `http://127.0.0.1:${(app.getHttpServer().address() as AddressInfo).port}`;
     prisma = app.get(PrismaService);
     queue = app.get(QueueService);
+    redis = app.get(RedisService);
 
     // Deterministic session key so cleanup can wipe stale Redis (queue + token
     // counters) from a prior run BEFORE we seed — same-day always resolves here.
@@ -55,6 +59,12 @@ describe('Voice API (/voice) — real infra', () => {
     await prisma.hospital.create({ data: { id: HOSP, name: 'VC Hospital' } });
     await prisma.clinic.create({ data: { id: CLINIC, hospitalId: HOSP, name: 'VC Clinic' } });
     await prisma.voiceNumber.create({ data: { didNumber: DID, clinicId: CLINIC } });
+    // The OP engine is the source of truth for the token now, and it renders the
+    // number from the clinic's TokenSeries — no series, no token, and /voice/bookings
+    // 409s. Prefix 'A' is what makes the caller's token read A001 below.
+    await prisma.tokenSeries.create({
+      data: { id: SERIES, clinicId: CLINIC, code: 'NORMAL_OP', label: 'Normal OP', prefix: 'A', padWidth: 3, startAt: 1 },
+    });
     await prisma.doctor.create({
       data: { id: DOCTOR, clinicId: CLINIC, name: 'Dr Voice', specialization: 'Cardiology', consultationFee: 400, avgConsultMinutes: 10 },
     });
@@ -83,8 +93,35 @@ describe('Voice API (/voice) — real infra', () => {
     await app.close();
   });
 
+  /** Encounter ids the OP engine raised for this doctor (mirrored from voice). */
+  async function opEncounterIds(): Promise<string[]> {
+    const rows = await prisma.encounter
+      .findMany({ where: { doctorId: DOCTOR }, select: { id: true } })
+      .catch(() => [] as { id: string }[]);
+    return rows.map((r) => r.id);
+  }
+
+  /** OP tokens raised for this doctor — the numbers callers are actually told. */
+  async function opTokenCount(): Promise<number> {
+    return prisma.token.count({ where: { encounterId: { in: await opEncounterIds() } } });
+  }
+
   async function cleanup(): Promise<void> {
     if (session) await queue.clearSession(session).catch(() => undefined);
+    // OP side first: encounters own the token / queue / read-model rows, and the
+    // Redis token counter must go too or a rerun starts at A002.
+    const eids = await opEncounterIds();
+    await prisma.queueEntry.deleteMany({ where: { encounterId: { in: eids } } }).catch(() => undefined);
+    await prisma.token.deleteMany({ where: { encounterId: { in: eids } } }).catch(() => undefined);
+    await prisma.checkIn.deleteMany({ where: { encounterId: { in: eids } } }).catch(() => undefined);
+    await prisma.registration.deleteMany({ where: { encounterId: { in: eids } } }).catch(() => undefined);
+    await prisma.queueReadModel.deleteMany({ where: { encounterId: { in: eids } } }).catch(() => undefined);
+    await prisma.domainEvent.deleteMany({ where: { streamId: { in: eids } } }).catch(() => undefined);
+    await prisma.encounter.deleteMany({ where: { id: { in: eids } } }).catch(() => undefined);
+    await prisma.opSession.deleteMany({ where: { doctorId: DOCTOR } }).catch(() => undefined);
+    // PER_SESSION counter key — see TokenSeriesService.counterKey.
+    await redis.redis.del(`pfos:tokenseq:${SERIES}:${DOCTOR}:${todayYmd()}`).catch(() => undefined);
+    await prisma.tokenSeries.deleteMany({ where: { id: SERIES } }).catch(() => undefined);
     await prisma.voiceCallLog.deleteMany({ where: { callSid: { in: ['call-1', 'log-1'] } } });
     await prisma.auditLog.deleteMany({ where: { doctorId: DOCTOR } });
     await prisma.booking.deleteMany({ where: { doctorId: DOCTOR } });
@@ -159,7 +196,9 @@ describe('Voice API (/voice) — real infra', () => {
     const b2 = (await again.json()) as { bookingId: string; tokenNumber: string };
     expect(b2.bookingId).toBe(b.bookingId);
     expect(b2.tokenNumber).toBe('A001');
-    expect(await queue.size(session)).toBe(2); // filler (W001) + voice (A001), no dup
+    // The OP engine holds the voice token now, so the retry must not raise a
+    // second one. (The legacy queue only ever sees the walk-in filler.)
+    expect(await opTokenCount()).toBe(1);
   });
 
   it('rejects a session the caller asked for that is not the one open now (409)', async () => {
@@ -171,7 +210,7 @@ describe('Voice API (/voice) — real infra', () => {
   });
 
   it('a repeat call for a doctor already held returns the same token (no phantom hold)', async () => {
-    const before = await queue.size(session);
+    const before = await opTokenCount();
     const res = await voice('/voice/bookings', {
       didNumber: DID, doctorId: DOCTOR, sessionType: 'MORNING',
       patientPhone: PHONE, callSid: 'call-different', // different call, same caller+doctor
@@ -179,7 +218,7 @@ describe('Voice API (/voice) — real infra', () => {
     expect(res.status).toBe(201);
     const b = (await res.json()) as { tokenNumber: string };
     expect(b.tokenNumber).toBe('A001'); // the existing hold, not a new token
-    expect(await queue.size(session)).toBe(before); // queue unchanged
+    expect(await opTokenCount()).toBe(before); // no phantom second token
   });
 
   it('lookup returns the caller’s live appointment, scoped to the dialed clinic', async () => {

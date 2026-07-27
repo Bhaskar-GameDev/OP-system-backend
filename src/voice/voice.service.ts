@@ -13,7 +13,6 @@ import {
   PaymentStatus,
   Prisma,
   RegistrationSource,
-  SessionType,
 } from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { SessionResolverService } from '../bookings/session-resolver.service';
@@ -23,6 +22,7 @@ import { PaymentsService } from '../payments/payments.service';
 import { OpMirrorService } from '../op-mirror/op-mirror.service';
 import { ConsultationEngineService } from '../consultation/consultation-engine.service';
 import { QueueReadService } from '../read-side/queue-read.service';
+import { ProjectionRunner } from '../read-side/projection-runner.service';
 import { OpConfigService } from '../config-engine/op-config.service';
 import { SessionKey } from '../queue-engine/token.service';
 import { SessionClaims } from '../auth/auth-token.service';
@@ -68,6 +68,7 @@ export class VoiceService {
     private readonly mirror: OpMirrorService,
     private readonly consultEngine: ConsultationEngineService,
     private readonly queueRead: QueueReadService,
+    private readonly projection: ProjectionRunner,
     private readonly config: OpConfigService,
   ) {}
 
@@ -248,12 +249,6 @@ export class VoiceService {
       select: { id: true },
     });
 
-    const session: SessionKey = {
-      doctorId: req.doctorId,
-      sessionDate: resolved.sessionDate,
-      sessionType: resolved.sessionType,
-    };
-
     // OP cutover: the token-based OP engine is now the source of truth for the
     // token, so raise it there (register -> check-in -> issue token -> enqueue)
     // instead of the legacy queue engine. `present: true` runs the same
@@ -374,8 +369,14 @@ export class VoiceService {
   }): Promise<void> {
     try {
       // Position comes from the OP read model now (same source the frontends and
-      // queue-status read). It is a projection, so it can briefly lag the enqueue
-      // — if so we simply omit the wait sentence rather than quote a wrong one.
+      // queue-status read). The projector runs on a 2s tick, so the row for the
+      // encounter we just enqueued is not there yet and the caller would get an
+      // SMS with no wait in it — every time, since the SMS goes out inside this
+      // request. Drain the projection first: runOnce is idempotent, resumable,
+      // and exactly what the tick calls, so this only pulls the tick forward.
+      await this.projection.runOnce();
+      // Still a projection, so it can lag — if the row is somehow absent we omit
+      // the wait sentence rather than quote a wrong one.
       const tracking = await this.queueRead.patientTracking(args.encounterId);
       let wait = '';
       if (tracking) {
