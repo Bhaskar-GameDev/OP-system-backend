@@ -144,6 +144,20 @@ export class AuditService {
       bookings.map((b) => [b.id, b.patient?.name ?? null]),
     );
 
+    // DONE / SKIP / NO_SHOW are recorded against a token, not a bookingId (only
+    // PRIORITY and REINSERT carry one), so those rows would always render a
+    // nameless patient. Resolve them from the session+token they DO carry.
+    const patientByToken = await this.resolvePatientsByToken(
+      rows
+        .filter((r) => !r.bookingId && r.token)
+        .map((r) => ({
+          doctorId: r.doctorId,
+          sessionDate: r.sessionDate,
+          sessionType: r.sessionType,
+          token: r.token as string,
+        })),
+    );
+
     const entries: AuditLogView[] = rows.map((r) => ({
       id: r.id,
       timestamp: r.createdAt.toISOString(),
@@ -154,7 +168,11 @@ export class AuditService {
       token: r.token,
       patientName: r.bookingId
         ? patientByBooking.get(r.bookingId) ?? null
-        : null,
+        : r.token
+          ? patientByToken.get(
+              tokenKey(r.doctorId, r.sessionDate, r.sessionType, r.token),
+            ) ?? null
+          : null,
       doctorId: r.doctorId,
       doctorName: doctorName.get(r.doctorId) ?? null,
       sessionDate: r.sessionDate.toISOString().slice(0, 10),
@@ -164,4 +182,78 @@ export class AuditService {
 
     return { entries, total, limit: q.limit, offset: q.offset };
   }
+
+  /**
+   * Batch-resolve patient names for audit rows that identify their target by
+   * session+token rather than bookingId. One query per distinct session (there
+   * are few per page), each fetching only the tokens that page actually needs.
+   */
+  private async resolvePatientsByToken(
+    targets: {
+      doctorId: string;
+      sessionDate: Date;
+      sessionType: SessionType;
+      token: string;
+    }[],
+  ): Promise<Map<string, string | null>> {
+    const out = new Map<string, string | null>();
+    if (!targets.length) return out;
+
+    // group tokens by session so each session costs one `in` query
+    const bySession = new Map<
+      string,
+      { doctorId: string; sessionDate: Date; sessionType: SessionType; tokens: Set<string> }
+    >();
+    for (const t of targets) {
+      const key = `${t.doctorId}|${t.sessionDate.toISOString()}|${t.sessionType}`;
+      const group = bySession.get(key);
+      if (group) group.tokens.add(t.token);
+      else
+        bySession.set(key, {
+          doctorId: t.doctorId,
+          sessionDate: t.sessionDate,
+          sessionType: t.sessionType,
+          tokens: new Set([t.token]),
+        });
+    }
+
+    const results = await Promise.all(
+      [...bySession.values()].map((g) =>
+        this.prisma.booking.findMany({
+          where: {
+            doctorId: g.doctorId,
+            sessionDate: g.sessionDate,
+            sessionType: g.sessionType,
+            tokenNumber: { in: [...g.tokens] },
+          },
+          select: {
+            doctorId: true,
+            sessionDate: true,
+            sessionType: true,
+            tokenNumber: true,
+            patient: { select: { name: true } },
+          },
+        }),
+      ),
+    );
+
+    for (const row of results.flat()) {
+      if (!row.tokenNumber) continue;
+      out.set(
+        tokenKey(row.doctorId, row.sessionDate, row.sessionType, row.tokenNumber),
+        row.patient?.name ?? null,
+      );
+    }
+    return out;
+  }
+}
+
+/** Stable key for the (session, token) pair an audit row points at. */
+function tokenKey(
+  doctorId: string,
+  sessionDate: Date,
+  sessionType: SessionType,
+  token: string,
+): string {
+  return `${doctorId}|${sessionDate.toISOString()}|${sessionType}|${token}`;
 }

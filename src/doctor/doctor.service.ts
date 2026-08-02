@@ -115,12 +115,18 @@ export class DoctorService {
   ): Promise<DoctorCompletedView> {
     const sessionDate = this.today();
 
-    // The live `bookings` table only holds the current day's settled rows: the
-    // nightly archival sweep moves older terminal bookings into booking_history.
-    // So all COMPLETED rows here are this session/day's — no date filter needed
-    // (and none that would be fragile across the @db.Date / local-day boundary).
+    // Filter on the day explicitly. The nightly archival sweep (2AM cron) is the
+    // only thing that would otherwise keep this list to today, and it is NOT a
+    // correctness boundary: any backend downtime over 2AM leaves yesterday's
+    // terminal bookings in `bookings`, and they then surface here as "completed
+    // today" — a doctor could open and edit a note for a patient seen days ago.
     const rows = await this.prisma.booking.findMany({
-      where: { doctorId, sessionType, status: BookingStatus.COMPLETED },
+      where: {
+        doctorId,
+        sessionType,
+        status: BookingStatus.COMPLETED,
+        sessionDate: new Date(sessionDate),
+      },
       select: {
         id: true,
         tokenNumber: true,

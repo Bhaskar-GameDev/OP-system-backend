@@ -212,7 +212,7 @@ describe('OP engine E2E — three sources, one queue, multi-tenant isolation', (
     expect((await prisma.encounter.findUniqueOrThrow({ where: { id: first } })).status).toBe(EncounterStatus.COMPLETED);
 
     // drive the projection, then the read models reflect the new reality
-    await scheduler.tick();
+    await scheduler.drain();
     const track = await get(`/op/encounters/${first}/tracking`, staffA);
     expect(track.status).toBe(200);
     expect(((await track.json()) as { status: string }).status).toBe(EncounterStatus.COMPLETED);

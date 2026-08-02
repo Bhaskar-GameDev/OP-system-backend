@@ -88,12 +88,20 @@ export class ReceptionService {
       create: { mobile: input.mobile, name: input.name },
       update: {},
     });
+    let patientName = patient.name;
     if (!patient.name && input.name) {
       await this.prisma.patient.update({
         where: { id: patient.id },
         data: { name: input.name },
       });
+      patientName = input.name;
     }
+    // An existing record keeps its stored name — a desk typo must never rename a
+    // real patient. But the mismatch cannot stay silent either: the doctor's
+    // screen will show `patientName`, so the desk is told which record it hit.
+    const nameMismatch = Boolean(
+      input.name && patientName && patientName.trim() !== input.name.trim(),
+    );
 
     // real booking row — BOOKED so the promote guard (BOOKED -> ACTIVE) holds
     const booking = await this.prisma.booking.create({
@@ -147,6 +155,8 @@ export class ReceptionService {
     return {
       bookingId: updated.id,
       patientId: updated.patientId,
+      patientName,
+      nameMismatch,
       tokenNumber: updated.tokenNumber ?? entry.tokenNumber,
       status: updated.status,
       doctorId: input.doctorId,

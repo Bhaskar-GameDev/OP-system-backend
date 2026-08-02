@@ -125,7 +125,7 @@ describe('OP realtime — new-engine live updates over sockets', () => {
    * drains all pending events and, if any applied, re-pushes to watched rooms.
    */
   async function settle(): Promise<void> {
-    await scheduler.tick();
+    await scheduler.drain();
   }
 
   // register -> check-in(+token) -> enqueue; returns the opSessionId + encounterId

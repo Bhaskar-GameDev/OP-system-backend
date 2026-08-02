@@ -29,10 +29,18 @@ describe('Consultation notes', () => {
   let ptToken = '';
   let ptOtherToken = '';
 
+  /**
+   * Today's session date in the SAME encoding every production writer uses:
+   * the local calendar date as UTC midnight (`new Date('YYYY-MM-DD')`).
+   * Local midnight would be wrong here — `session_date` is `@db.Date`, so on any
+   * UTC+ machine a local-midnight timestamp truncates to the PREVIOUS day and
+   * the row lands on yesterday's session.
+   */
   function today(): Date {
     const d = new Date();
-    d.setHours(0, 0, 0, 0);
-    return d;
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return new Date(`${d.getFullYear()}-${m}-${day}`);
   }
 
   beforeAll(async () => {
@@ -166,5 +174,37 @@ describe('Consultation notes', () => {
     expect(entry).toBeTruthy();
     expect(entry.hasNote).toBe(true);
     expect(entry.patientName).toBe('Note Patient');
+  });
+
+  /**
+   * "Completed TODAY" must mean today. The query originally had no date filter
+   * at all — it relied on the 2AM archival cron having swept older terminal
+   * bookings out of `bookings`. That is not a correctness boundary: any backend
+   * downtime over 2AM leaves yesterday's rows in place, and they then surface
+   * here as today's work, with an editable consultation note attached to a
+   * patient the doctor saw days ago.
+   */
+  it('excludes a completed booking from a previous day', async () => {
+    const yesterday = new Date(today());
+    yesterday.setUTCDate(yesterday.getUTCDate() - 1);
+
+    const stale = await prisma.booking.create({
+      data: {
+        patientId: PT,
+        doctorId: DOC,
+        source: 'APP',
+        tokenNumber: 'A999',
+        sessionDate: yesterday,
+        sessionType: 'MORNING',
+        status: 'COMPLETED',
+        consultationEndedAt: new Date(),
+      },
+      select: { id: true },
+    });
+
+    const body = await (await api('/doctor/completed?sessionType=MORNING', {}, docToken)).json();
+    const ids = body.entries.map((e: { bookingId: string }) => e.bookingId);
+    expect(ids).toContain(BK); // today's is still there
+    expect(ids).not.toContain(stale.id); // yesterday's is not
   });
 });

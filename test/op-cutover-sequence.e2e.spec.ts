@@ -133,7 +133,7 @@ describe('Cutover sequence (flipped clinic, all compat layers together)', () => 
     expect(await prisma.queueEntry.findUnique({ where: { encounterId: encId } })).not.toBeNull();
 
     // 3. Project so the read models catch up.
-    await scheduler.tick();
+    await scheduler.drain();
 
     // 4. Patient's own status (resolved via channelMeta) shows the NEW-engine queue.
     const mine = (await (await get(`/queue/my-status?bookingId=${BOOKING}`, patientTok)).json()) as { tokenNumber: string; position: number; status: string };
@@ -148,7 +148,7 @@ describe('Cutover sequence (flipped clinic, all compat layers together)', () => 
     const opSessionId = (await prisma.queueEntry.findUniqueOrThrow({ where: { encounterId: encId } })).opSessionId;
     expect((await post(`/op/sessions/${opSessionId}/call-next`, doctorTok)).status).toBe(201);
     await post(`/op/encounters/${encId}/start`, doctorTok, {});
-    await scheduler.tick();
+    await scheduler.drain();
     const seen = (await (await get(`/queue/my-status?bookingId=${BOOKING}`, patientTok)).json()) as { status: string };
     expect(seen.status).toBe('in_consultation');
   });

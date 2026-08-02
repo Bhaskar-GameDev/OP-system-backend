@@ -124,6 +124,14 @@ export interface RegisterWalkInInput {
 export interface WalkInView {
   bookingId: string;
   patientId: string;
+  /**
+   * The name ON RECORD for this mobile — not necessarily the name the desk
+   * typed. An existing patient keeps their stored name, so the desk must see
+   * which record the token was actually issued against.
+   */
+  patientName: string | null;
+  /** True when the desk typed a name that differs from the stored one. */
+  nameMismatch: boolean;
   tokenNumber: string;
   status: string; // BOOKED, or ACTIVE if it landed at rank 0
   doctorId: string;

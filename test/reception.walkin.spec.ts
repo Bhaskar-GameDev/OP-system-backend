@@ -25,7 +25,7 @@ describe('Reception walk-in registration (full stack)', () => {
   const CLINIC_B = 'wi-clinic-b';
   const DOCTOR_A = 'wi-doc-a';
   const DOCTOR_B = 'wi-doc-b';
-  const MOBILES = ['7100000001', '7100000002', '7100000003'];
+  const MOBILES = ['7100000001', '7100000002', '7100000003', '7100000009', '7100000010'];
   const session: SessionKey = {
     doctorId: DOCTOR_A,
     sessionDate: '2026-06-22',
@@ -77,6 +77,8 @@ describe('Reception walk-in registration (full stack)', () => {
   interface WalkInView {
     bookingId: string;
     patientId: string;
+    patientName: string | null;
+    nameMismatch: boolean;
     tokenNumber: string;
     status: string;
   }
@@ -198,5 +200,49 @@ describe('Reception walk-in registration (full stack)', () => {
     const after = await list();
     expect(after).toContain(prioBody.token);
     expect(after.indexOf(prioBody.token)).toBe(1);
+  });
+
+  /**
+   * A mobile already on file keeps the name ON RECORD — a desk typo must never
+   * rename a real patient. But the divergence cannot be silent either: the
+   * doctor's screen renders the stored name, so if the desk types something
+   * different they would otherwise call out a name nobody on the queue answers
+   * to. The response therefore reports which record the token was issued
+   * against, and flags the mismatch.
+   */
+  describe('existing patient by mobile', () => {
+    const REPEAT = '7100000009';
+
+    it('returns the stored name and no mismatch when the desk types it the same', async () => {
+      const first = (await (await walkin(REPEAT, 'Sunil Rao')).json()) as WalkInView;
+      expect(first.patientName).toBe('Sunil Rao');
+      expect(first.nameMismatch).toBe(false);
+
+      const same = (await (await walkin(REPEAT, 'Sunil Rao')).json()) as WalkInView;
+      expect(same.patientId).toBe(first.patientId);
+      expect(same.nameMismatch).toBe(false);
+    });
+
+    it('keeps the stored name and flags the mismatch when the desk types another', async () => {
+      const res = (await (await walkin(REPEAT, 'Totally Different')).json()) as WalkInView;
+      expect(res.patientName).toBe('Sunil Rao'); // record wins
+      expect(res.nameMismatch).toBe(true);
+
+      // the patient row itself is untouched — no silent rename
+      const patient = await prisma.patient.findUniqueOrThrow({ where: { mobile: REPEAT } });
+      expect(patient.name).toBe('Sunil Rao');
+    });
+
+    it('fills a blank name in, and that is not a mismatch', async () => {
+      const BLANK = '7100000010';
+      await prisma.patient.create({ data: { mobile: BLANK, name: '' } });
+
+      const res = (await (await walkin(BLANK, 'Freshly Named')).json()) as WalkInView;
+      expect(res.patientName).toBe('Freshly Named');
+      expect(res.nameMismatch).toBe(false);
+
+      const patient = await prisma.patient.findUniqueOrThrow({ where: { mobile: BLANK } });
+      expect(patient.name).toBe('Freshly Named');
+    });
   });
 });

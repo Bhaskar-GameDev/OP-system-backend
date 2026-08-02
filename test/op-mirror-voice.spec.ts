@@ -1,6 +1,6 @@
 process.env.VOICE_INTERNAL_SECRET = process.env.VOICE_INTERNAL_SECRET ?? 'test-voice-secret';
 
-import { INestApplication } from '@nestjs/common';
+import { ConflictException, INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { EncounterStatus, SessionType, TokenResetPolicy } from '@prisma/client';
 import { AppModule } from '../src/app.module';
@@ -11,11 +11,20 @@ import { QueueService } from '../src/queue-engine/queue.service';
 import { SessionKey } from '../src/queue-engine/token.service';
 
 /**
- * Task 2 dual-write — VOICE channel (voice.book). Proves a phone booking ALSO
- * mirrors into the new engine as a REGISTER-ONLY Encounter (source VOICE_AGENT),
- * idempotent on callSid, with the legacy pay-at-desk booking untouched.
+ * VOICE channel (voice.book) against the OP engine.
+ *
+ * Post-cutover contract (2026-07-26): the agent raises the OP token AT BOOKING,
+ * so the mirror runs the FULL combined path (`present: true`) — register ->
+ * check-in -> issue token -> enqueue — exactly like the reception desk. The OP
+ * `displayNumber` is authoritative: it is what the caller is told, what the SMS
+ * carries, and what the doctor/reception read models render. The legacy Booking
+ * survives only as the correlation + refund/audit anchor and has the OP token
+ * copied onto it.
+ *
+ * (This replaces the pre-cutover contract, where voice mirrored REGISTER-ONLY
+ * and the token was deferred to desk check-in.)
  */
-describe('Dual-write: voice.book mirrors a VOICE booking into the new engine', () => {
+describe('voice.book raises an OP token into the new engine', () => {
   let app: INestApplication;
   let prisma: PrismaService;
   let redis: RedisService;
@@ -29,6 +38,7 @@ describe('Dual-write: voice.book mirrors a VOICE booking into the new engine', (
   const SERIES = `mv-series-${stamp}`;
   const DID = `+9100000${String(stamp).slice(-5)}`;
   const PHONE = '9300009991';
+  const PHONE_NO_SERIES = '9300009992';
   const CALLSID = `mv-call-${stamp}`;
   const encounterIds: string[] = [];
 
@@ -80,7 +90,7 @@ describe('Dual-write: voice.book mirrors a VOICE booking into the new engine', (
     await prisma.booking.updateMany({ where: { doctorId: DOCTOR }, data: { paymentId: null } }).catch(() => {});
     await prisma.payment.deleteMany({ where: { bookingId: { in: bs.map((b) => b.id) } } }).catch(() => {});
     await prisma.booking.deleteMany({ where: { doctorId: DOCTOR } }).catch(() => {});
-    await prisma.patient.deleteMany({ where: { mobile: PHONE } }).catch(() => {});
+    await prisma.patient.deleteMany({ where: { mobile: { in: [PHONE, PHONE_NO_SERIES] } } }).catch(() => {});
     await prisma.tokenSeries.deleteMany({ where: { id: SERIES } }).catch(() => {});
     await prisma.doctorSession.deleteMany({ where: { doctorId: DOCTOR } }).catch(() => {});
     await prisma.voiceNumber.deleteMany({ where: { clinicId: CLINIC } }).catch(() => {});
@@ -89,12 +99,11 @@ describe('Dual-write: voice.book mirrors a VOICE booking into the new engine', (
     await prisma.hospital.deleteMany({ where: { id: HOSP } }).catch(() => {});
   }
 
-  it('a VOICE booking yields a register-only mirrored Encounter (source VOICE_AGENT)', async () => {
+  it('a VOICE booking issues an OP token and enqueues (source VOICE_AGENT)', async () => {
     const res = await voice.book({
       didNumber: DID, doctorId: DOCTOR, sessionType: 'MORNING',
       patientPhone: PHONE, patientName: 'Voice Caller', callSid: CALLSID,
     });
-    expect(res.tokenNumber).toBeTruthy(); // legacy pay-at-desk token issued as before
 
     const reg = await prisma.registration.findFirst({
       where: { source: 'VOICE_AGENT', channelMeta: { path: ['legacyBookingId'], equals: res.bookingId } },
@@ -103,11 +112,41 @@ describe('Dual-write: voice.book mirrors a VOICE booking into the new engine', (
     expect(reg).not.toBeNull();
     encounterIds.push(reg!.encounterId);
 
-    // REGISTER-ONLY: REGISTERED, no token, no queue entry (token comes at desk check-in)
+    // FULL combined path: checked in, token issued, sitting in the queue.
     const enc = await prisma.encounter.findUniqueOrThrow({ where: { id: reg!.encounterId } });
-    expect(enc.status).toBe(EncounterStatus.REGISTERED);
-    expect(await prisma.token.findUnique({ where: { encounterId: reg!.encounterId } })).toBeNull();
-    expect(await prisma.queueEntry.findUnique({ where: { encounterId: reg!.encounterId } })).toBeNull();
+    expect(enc.status).toBe(EncounterStatus.WAITING);
+
+    const token = await prisma.token.findUnique({ where: { encounterId: reg!.encounterId } });
+    expect(token).not.toBeNull();
+    expect(await prisma.queueEntry.findUnique({ where: { encounterId: reg!.encounterId } })).not.toBeNull();
+
+    // The OP displayNumber is what the caller is quoted — from the seeded
+    // NORMAL_OP series (prefix N, padWidth 3, startAt 1).
+    expect(token!.displayNumber).toBe('N001');
+    expect(res.tokenNumber).toBe(token!.displayNumber);
+
+    // ...and it is mirrored onto the legacy booking so lookup/cancel read one number.
+    const legacy = await prisma.booking.findUniqueOrThrow({ where: { id: res.bookingId } });
+    expect(legacy.tokenNumber).toBe(token!.displayNumber);
+    expect(legacy.payAtDesk).toBe(true);
+  });
+
+  it('rejects rather than confirming a token-less booking when no series exists', async () => {
+    // Without a TokenSeries the mirror cannot raise a token. OP is authoritative,
+    // so there is nothing to quote — the agent must re-offer, not confirm a phantom.
+    await prisma.tokenSeries.delete({ where: { id: SERIES } });
+    try {
+      await expect(
+        voice.book({
+          didNumber: DID, doctorId: DOCTOR, sessionType: 'MORNING',
+          patientPhone: PHONE_NO_SERIES, patientName: 'No Series', callSid: `${CALLSID}-ns`,
+        }),
+      ).rejects.toThrow(ConflictException);
+    } finally {
+      await prisma.tokenSeries.create({
+        data: { id: SERIES, clinicId: CLINIC, code: 'NORMAL_OP', label: 'Normal', prefix: 'N', padWidth: 3, startAt: 1, resetPolicy: TokenResetPolicy.PER_SESSION },
+      });
+    }
   });
 
   it('is idempotent on callSid — a retried call maps to the same Encounter', async () => {
