@@ -16,6 +16,19 @@ import {
 } from '../src/notifications/notifications.service';
 import { PUSH_SENDER, PushMessage, PushSender } from '../src/notifications/push.sender';
 
+/**
+ * Wait until `check` passes, polling briefly. For asserting on fire-and-forget
+ * async work (the notification subscription) without pinning the test to a
+ * fixed sleep — which fails on a loaded machine and silently passes for the
+ * wrong reason on a fast one.
+ */
+async function waitFor(check: () => boolean, timeoutMs = 3000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!check() && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
 /** Records every push so the test can count by type. */
 class FakePush implements PushSender {
   readonly sent: { deviceToken: string; message: PushMessage }[] = [];
@@ -164,8 +177,13 @@ describe('NotificationsService — threshold-crossing, exactly-once (real Redis 
       (await import('../src/queue-engine/queue-events.service')).QueueEventsService,
     );
     events.sessionChanged(session);
-    // subscription handler is fire-and-forget async -> let it settle
-    await new Promise((r) => setTimeout(r, 50));
+
+    // The subscription handler is fire-and-forget async, so the test has to wait
+    // for it. POLL for the expected count rather than sleeping a fixed 50ms:
+    // that assumed the handler always finishes inside an arbitrary window, and
+    // on a loaded machine it does not — the assertion then reads a half-finished
+    // batch (1 of 3) and fails for reasons that have nothing to do with the code.
+    await waitFor(() => push.countOf(NotificationType.QUEUE_APPROACHING) === 3);
 
     // front 3 are all within the approaching window -> 3 fired via the subscription
     expect(push.countOf(NotificationType.QUEUE_APPROACHING)).toBe(3);

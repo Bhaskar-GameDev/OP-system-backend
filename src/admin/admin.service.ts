@@ -47,6 +47,11 @@ const DOCTOR_SELECT = {
   avgConsultMinutes: true,
   photoUrl: true,
   username: true,
+  // Both feed admin-only flags (canSignIn / sessionCount) so a half-configured
+  // doctor is visible on the admin screen rather than discovered by a patient.
+  // `toAdminDoctor` reduces the hash to a boolean — it is never sent to a client.
+  passwordHash: true,
+  _count: { select: { sessions: true } },
 } satisfies Prisma.DoctorSelect;
 
 const SESSION_SELECT = {

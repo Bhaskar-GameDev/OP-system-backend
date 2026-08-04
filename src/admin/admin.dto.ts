@@ -26,6 +26,23 @@ export interface AdminDoctorView {
   avgConsultMinutes: number;
   photoUrl: string | null;
   username: string | null;
+  /**
+   * Whether this doctor can actually sign into the doctor app — they need BOTH
+   * a username and a password on file (`doctorLogin` rejects a null hash).
+   * Credentials are optional at creation, so it is entirely possible to create a
+   * doctor who is bookable by patients but can never open their own queue. The
+   * admin screen has no other way to see that, so it is surfaced here.
+   * The hash itself is never returned.
+   */
+  canSignIn: boolean;
+  /**
+   * How many weekly session templates the doctor has. Zero means they are
+   * listed to patients but not bookable — `resolveToday` finds no open session
+   * and booking 409s "this doctor has no sessions today". Surfaced so the admin
+   * screen can flag a half-configured doctor instead of leaving it to be
+   * discovered by a patient.
+   */
+  sessionCount: number;
 }
 
 export interface AdminDoctorSessionView {
@@ -62,6 +79,9 @@ type DoctorLike = {
   avgConsultMinutes: number;
   photoUrl?: string | null;
   username?: string | null;
+  /** Presence only — the hash is used to derive `canSignIn`, never returned. */
+  passwordHash?: string | null;
+  _count?: { sessions: number };
 };
 type DoctorSessionLike = {
   id: string;
@@ -98,6 +118,8 @@ export function toAdminDoctor(d: DoctorLike): AdminDoctorView {
     avgConsultMinutes: d.avgConsultMinutes,
     photoUrl: d.photoUrl ?? null,
     username: d.username ?? null,
+    canSignIn: Boolean(d.username && d.passwordHash),
+    sessionCount: d._count?.sessions ?? 0,
   };
 }
 

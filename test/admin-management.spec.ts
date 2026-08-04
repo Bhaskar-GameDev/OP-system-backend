@@ -111,6 +111,65 @@ describe('Admin management (clinics / doctors / sessions)', () => {
     await prisma.doctor.delete({ where: { id: doc.id } });
   });
 
+  /**
+   * A doctor can be created in two states that are invisible everywhere else:
+   * without credentials (bookable by patients, but can never sign into the
+   * doctor app), and without a session (listed to patients, but `resolveToday`
+   * finds nothing and booking 409s). The admin screen is the only place either
+   * can still be fixed, so the read model has to carry them.
+   */
+  it('flags a doctor who cannot sign in and has no schedule', async () => {
+    const bare = (await (await newDoctor({ name: 'Dr Bare', consultationFee: 300 })).json()) as {
+      id: string;
+      canSignIn: boolean;
+      sessionCount: number;
+      username: string | null;
+    };
+    expect(bare.canSignIn).toBe(false);
+    expect(bare.sessionCount).toBe(0);
+
+    // a username alone is still not enough to sign in — the password is what
+    // `doctorLogin` actually checks
+    const noPass = (await (await newDoctor({
+      name: 'Dr NoPass',
+      consultationFee: 300,
+      username: `u-nopass-${Date.now()}`,
+    })).json()) as { id: string; canSignIn: boolean };
+    expect(noPass.canSignIn).toBe(false);
+
+    const full = (await (await newDoctor({
+      name: 'Dr Full',
+      consultationFee: 300,
+      username: `u-full-${Date.now()}`,
+      password: 'secret123',
+    })).json()) as { id: string; canSignIn: boolean; sessionCount: number };
+    expect(full.canSignIn).toBe(true);
+    expect(full.sessionCount).toBe(0); // credentials say nothing about schedule
+
+    // adding a session clears the other flag
+    const sess = await adminFetch(`/admin/doctors/${full.id}/sessions`, {
+      method: 'POST',
+      body: JSON.stringify({ sessionType: 'MORNING', startTime: '09:00', maxTokens: 20, daysOfWeek: [1] }),
+    });
+    expect(sess.status).toBe(201);
+
+    const list = (await (await adminFetch('/admin/doctors')).json()) as {
+      id: string;
+      canSignIn: boolean;
+      sessionCount: number;
+    }[];
+    const refreshed = list.find((d) => d.id === full.id);
+    expect(refreshed).toBeDefined();
+    expect(refreshed!.sessionCount).toBe(1);
+    expect(refreshed!.canSignIn).toBe(true);
+
+    // the password hash itself must never reach a client
+    expect(JSON.stringify(list)).not.toContain('passwordHash');
+
+    await prisma.doctorSession.deleteMany({ where: { doctorId: full.id } });
+    await prisma.doctor.deleteMany({ where: { id: { in: [bare.id, noPass.id, full.id] } } });
+  });
+
   it('sessions: one per weekday — a second session on a shared day is rejected', async () => {
     const docRes = await newDoctor({ name: 'Dr Sched', consultationFee: 300 });
     const doc = (await docRes.json()) as { id: string };
