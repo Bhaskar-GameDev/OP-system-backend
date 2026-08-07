@@ -165,14 +165,24 @@ export class ConsultationService {
   /**
    * Enqueue a paid booking. If it lands at rank 0 (empty queue) it is promoted
    * to ACTIVE immediately — i.e. the doctor can see them now.
+   *
+   * `displayToken` carries a number the OP engine already minted for this visit
+   * (see QueueService.enqueue) so both engines show the same one.
    */
   async enqueueBooking(
     source: TokenSource,
     session: SessionKey,
     bookingId: string,
+    displayToken = '',
   ): Promise<QueueEntry> {
     const baseline = await this.tokenBaselineFor(source, session);
-    const entry = await this.queue.enqueue(source, session, bookingId, baseline);
+    const entry = await this.queue.enqueue(
+      source,
+      session,
+      bookingId,
+      baseline,
+      displayToken,
+    );
     if (entry.isFront) {
       await this.promote(entry.tokenNumber, session);
     }

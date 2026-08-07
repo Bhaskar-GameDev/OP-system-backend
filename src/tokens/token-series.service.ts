@@ -78,6 +78,43 @@ export class TokenSeriesService {
   }
 
   /**
+   * The number the legacy engine already quoted for this visit, if any.
+   *
+   * During the dual-write cutover one visit exists in both engines. If each
+   * minted its own number the patient would hold a slip that matches neither the
+   * doctor's screen nor the reception roster, depending on which surface has its
+   * cutover flag set. So the rule is: whichever engine first quotes a number to a
+   * human owns it, and the other carries it. An app booking gets its number at
+   * payment confirm (the patient sees it immediately), long before the desk
+   * checks them in — so OP adopts it here. Walk-in and voice reach this with the
+   * legacy row still token-less, so OP mints and legacy carries ours instead.
+   *
+   * Returns null when there is no legacy row or it has no token yet, which is
+   * also the whole post-teardown behaviour: mint normally.
+   */
+  private async legacyTokenFor(enc: {
+    id: string;
+    legacyBookingId: string | null;
+  }): Promise<string | null> {
+    let bookingId = enc.legacyBookingId;
+    if (!bookingId) {
+      const reg = await this.prisma.registration.findFirst({
+        where: { encounterId: enc.id },
+        select: { channelMeta: true },
+      });
+      const meta = reg?.channelMeta as { legacyBookingId?: string } | null;
+      bookingId = meta?.legacyBookingId ?? null;
+    }
+    if (!bookingId) return null;
+
+    const booking = await this.prisma.booking.findUnique({
+      where: { id: bookingId },
+      select: { tokenNumber: true },
+    });
+    return booking?.tokenNumber ?? null;
+  }
+
+  /**
    * Issue the next token for an encounter. Requires the encounter to be
    * CHECKED_IN (enforced via the state machine). Idempotent: a second call for
    * the same encounter returns the token already issued.
@@ -117,9 +154,16 @@ export class TokenSeriesService {
     const key = this.counterKey(series, { doctorId: enc.doctorId, serviceDate });
 
     // Atomic allocation. displaySeq honours the series' configured startAt.
+    // The counter is INCR'd even when a legacy number is adopted below, so the
+    // series stays dense and later self-minted tokens don't collide.
     const raw = await this.redis.redis.incr(key);
     const displaySeq = series.startAt - 1 + raw;
-    const displayNumber = this.render(series, displaySeq);
+    // ONE number per visit: if the legacy engine already quoted this patient a
+    // token (an app booking shows it from the moment payment succeeds), adopt it
+    // rather than minting a second one. Walk-in and voice reach here with the
+    // legacy row still token-less, so those mint here and legacy carries ours.
+    const displayNumber =
+      (await this.legacyTokenFor(enc)) ?? this.render(series, displaySeq);
 
     try {
       return await this.prisma.$transaction(async (tx) => {

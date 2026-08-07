@@ -16,6 +16,7 @@ import { Roles } from '../auth/roles.decorator';
 import { AdminService } from './admin.service';
 import { adminClinicId, assertClinicMatch } from './admin-scope';
 import { TenantScopeGuard, tenantHospitalId } from '../common/tenant/tenant-scope';
+import { TenantService } from '../common/tenant/tenant.service';
 import {
   CreateClinicInput,
   CreateDoctorInput,
@@ -41,7 +42,10 @@ type WithClinic = { clinicId?: string };
 @UseGuards(JwtAuthGuard, RolesGuard, TenantScopeGuard)
 @Roles('ADMIN')
 export class AdminController {
-  constructor(private readonly admin: AdminService) {}
+  constructor(
+    private readonly admin: AdminService,
+    private readonly tenant: TenantService,
+  ) {}
 
   // ─── Clinic (edit-only) ───
 
@@ -72,6 +76,28 @@ export class AdminController {
   @Post('clinics')
   createClinic(@Req() req: AuthedRequest, @Body() body: CreateClinicInput) {
     return this.admin.createClinic(tenantHospitalId(req), body);
+  }
+
+  /**
+   * Create staff in ANY clinic of the caller's own hospital — the bootstrap for
+   * a clinic that has no admin yet.
+   *
+   * `POST /admin/staff` deliberately stays own-clinic-only (scope from the
+   * token). That left a chicken-and-egg: a freshly created clinic could never
+   * get its first admin, because only an admin already inside it could make one.
+   * This route widens the scope to the HOSPITAL and no further — the clinic must
+   * belong to the caller's hospital or it reads as not-found, exactly like the
+   * other cross-clinic guards.
+   */
+  @Post('clinics/:id/staff')
+  async createStaffForClinic(
+    @Req() req: AuthedRequest,
+    @Param('id') clinicId: string,
+    @Body() body: CreateStaffInput,
+  ) {
+    const hospitalId = tenantHospitalId(req);
+    await this.tenant.assertClinicInHospital(hospitalId, clinicId);
+    return this.admin.createStaff(hospitalId, clinicId, body);
   }
 
   // ─── Doctors ───

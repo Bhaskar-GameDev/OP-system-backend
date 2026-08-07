@@ -4,7 +4,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
+import { Prisma, QueuePolicyMode, TokenResetPolicy } from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { DAILY_SESSION_TYPE } from '../common/session/daily-session';
 import { TenantService } from '../common/tenant/tenant.service';
@@ -143,19 +143,68 @@ export class AdminService {
     return this.getClinic(clinicId);
   }
 
+  /**
+   * Create a clinic AND the OP config it cannot function without.
+   *
+   * A clinic with no `TokenSeries` looks fine everywhere until someone tries to
+   * take a token: the OP engine cannot mint one, so voice booking 409s
+   * ("could not raise a token") and any OP check-in fails. Previously only
+   * `prisma/seed.ts` created that config, so every clinic made through this API
+   * was born broken — a trap that only surfaces at the first real patient.
+   *
+   * The whole thing is one transaction: a clinic that exists without its series
+   * is exactly the half-configured state this is meant to prevent.
+   */
   async createClinic(
     hospitalId: string,
     input: CreateClinicInput,
   ): Promise<AdminClinicView> {
-    const created = await this.prisma.clinic.create({
-      data: {
-        // hospitalId is taken from the TOKEN scope, never from the request body.
-        hospital: { connect: { id: hospitalId } },
-        name: req(input.name, 'name'),
-        address: input.address ?? null,
-        contactNumber: input.contactNumber ?? null,
-      },
-      select: CLINIC_SELECT,
+    const created = await this.prisma.$transaction(async (tx) => {
+      const clinic = await tx.clinic.create({
+        data: {
+          // hospitalId is taken from the TOKEN scope, never from the request body.
+          hospital: { connect: { id: hospitalId } },
+          name: req(input.name, 'name'),
+          address: input.address ?? null,
+          contactNumber: input.contactNumber ?? null,
+        },
+        select: CLINIC_SELECT,
+      });
+
+      // Same defaults the demo seed uses, so a hand-made clinic behaves like a
+      // seeded one: a normal and a special series, plus a clinic-default policy.
+      await tx.tokenSeries.createMany({
+        data: [
+          {
+            clinicId: clinic.id,
+            code: 'NORMAL_OP',
+            label: 'Normal OP',
+            prefix: 'N',
+            padWidth: 3,
+            startAt: 1,
+            resetPolicy: TokenResetPolicy.PER_SESSION,
+          },
+          {
+            clinicId: clinic.id,
+            code: 'SPECIAL_OP',
+            label: 'Special OP',
+            prefix: 'S',
+            padWidth: 3,
+            startAt: 101,
+            resetPolicy: TokenResetPolicy.PER_SESSION,
+          },
+        ],
+      });
+      await tx.queuePolicy.create({
+        data: {
+          clinicId: clinic.id,
+          doctorId: null,
+          mode: QueuePolicyMode.SHARED_FIFO,
+          ratio: { SPECIAL_OP: 2, NORMAL_OP: 1 },
+        },
+      });
+
+      return clinic;
     });
     return toAdminClinic(created);
   }

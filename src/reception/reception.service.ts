@@ -122,27 +122,15 @@ export class ReceptionService {
       sessionType: input.sessionType,
     };
 
-    // atomic token issue + enqueue (+ promote if front) + live broadcast
-    const entry = await this.consult.enqueueBooking(
-      TokenSource.WALK_IN,
-      session,
-      booking.id,
-    );
-
-    // write the display token back, exactly like payment-confirm
-    const updated = await this.prisma.booking.update({
-      where: { id: booking.id },
-      data: { tokenNumber: entry.tokenNumber },
-      select: { id: true, patientId: true, tokenNumber: true, status: true },
-    });
-
-    // Dual-write to the new engine (Task 2). The walk-in patient is at the desk,
-    // so this is the combined path: register + check-in + token + enqueue. Best
-    // effort — never blocks or fails the legacy booking above.
-    await this.mirror.mirror({
+    // Dual-write to the new engine FIRST. The walk-in patient is at the desk, so
+    // this is the combined path: register + check-in + token + enqueue. It runs
+    // ahead of the legacy enqueue purely so the OP token can become the ONE
+    // number for this visit — nothing has been quoted to the patient yet, so OP
+    // is free to mint. Still best effort: it never blocks or fails the booking.
+    const op = await this.mirror.mirror({
       source: RegistrationSource.RECEPTION,
       doctorId: input.doctorId,
-      patientId: updated.patientId,
+      patientId: patient.id,
       mobile: input.mobile,
       name: input.name,
       serviceDate: input.sessionDate,
@@ -150,6 +138,25 @@ export class ReceptionService {
       legacyBookingId: booking.id,
       actorId: clinicId,
       present: true,
+    });
+
+    // atomic token issue + enqueue (+ promote if front) + live broadcast.
+    // Carries the OP number when there is one, so the doctor screen (legacy
+    // Redis queue) and the reception roster (OP read model) cannot disagree
+    // whichever way the cutover flags are set. When the mirror failed we fall
+    // back to legacy minting — a desk must never be left without a token.
+    const entry = await this.consult.enqueueBooking(
+      TokenSource.WALK_IN,
+      session,
+      booking.id,
+      op?.token?.displayNumber ?? '',
+    );
+
+    // write the display token back, exactly like payment-confirm
+    const updated = await this.prisma.booking.update({
+      where: { id: booking.id },
+      data: { tokenNumber: entry.tokenNumber },
+      select: { id: true, patientId: true, tokenNumber: true, status: true },
     });
 
     return {

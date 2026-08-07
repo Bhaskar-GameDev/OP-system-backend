@@ -129,7 +129,11 @@ describe('Cutover sequence (flipped clinic, all compat layers together)', () => 
     const ci = await patch(`/reception/bookings/${encId}/checkin`, staff, { arrived: true });
     expect(ci.status).toBe(200);
     const token = await prisma.token.findUnique({ where: { encounterId: encId } });
-    expect(token?.displayNumber).toMatch(/^W\d{3}$/); // NEW engine token
+    // This booking was made in the app and has shown the patient 'P001' since
+    // payment, so the new engine ADOPTS that number rather than minting its own
+    // 'W001' from the series — one visit, one number. (Walk-in and voice arrive
+    // here token-less, and there the new engine mints and legacy carries it.)
+    expect(token?.displayNumber).toBe('P001');
     expect(await prisma.queueEntry.findUnique({ where: { encounterId: encId } })).not.toBeNull();
 
     // 3. Project so the read models catch up.

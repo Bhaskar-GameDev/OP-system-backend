@@ -106,11 +106,15 @@ describe('Dual-write: reception walk-in mirrors into the new engine', () => {
     expect(res.status).toBe(201);
     const view = (await res.json()) as { bookingId: string; tokenNumber: string };
     expect(view.bookingId).toBeTruthy();
-    expect(view.tokenNumber).toBe('W001'); // legacy token unchanged
+    // A walk-in has been quoted nothing yet when the desk hits register, so the
+    // NEW engine mints and the legacy row carries that number — the desk slip,
+    // the doctor's screen and the roster then cannot disagree. (This used to be
+    // legacy 'W001' beside an independent OP 'N001' for the same patient.)
+    expect(view.tokenNumber).toMatch(/^N\d{3}$/);
 
-    // legacy Booking still exists exactly as before
+    // legacy Booking still exists, now carrying the new engine's number
     const booking = await prisma.booking.findUniqueOrThrow({ where: { id: view.bookingId } });
-    expect(booking.tokenNumber).toBe('W001');
+    expect(booking.tokenNumber).toBe(view.tokenNumber);
 
     // the mirror registered a NEW Encounter, correlated by legacyBookingId
     const reg = await prisma.registration.findFirst({
@@ -125,7 +129,7 @@ describe('Dual-write: reception walk-in mirrors into the new engine', () => {
     expect(enc.status).toBe(EncounterStatus.WAITING);
 
     const token = await prisma.token.findUnique({ where: { encounterId: reg!.encounterId } });
-    expect(token?.displayNumber).toMatch(/^N\d{3}$/); // new series, independent of legacy 'W001'
+    expect(token?.displayNumber).toBe(view.tokenNumber); // same number, both engines
 
     const entry = await prisma.queueEntry.findUnique({ where: { encounterId: reg!.encounterId } });
     expect(entry).not.toBeNull();

@@ -96,6 +96,88 @@ describe('Admin management (clinics / doctors / sessions)', () => {
     expect(list.some((c) => c.id === created.id)).toBe(true);
   });
 
+  /**
+   * A clinic created through the API used to be born unusable: only
+   * `prisma/seed.ts` ever made a TokenSeries, so the OP engine could not mint a
+   * token and voice booking 409'd at the first real patient. Creating the clinic
+   * now provisions its OP config in the same transaction.
+   */
+  it('provisions OP token config with a new clinic', async () => {
+    const res = await adminFetch('/admin/clinics', {
+      method: 'POST',
+      body: JSON.stringify({ name: 'Provisioned Clinic' }),
+    });
+    expect(res.status).toBe(201);
+    const clinic = (await res.json()) as { id: string };
+    createdClinicIds.push(clinic.id);
+
+    const series = await prisma.tokenSeries.findMany({
+      where: { clinicId: clinic.id },
+      orderBy: { code: 'asc' },
+    });
+    expect(series.map((s) => s.code)).toEqual(['NORMAL_OP', 'SPECIAL_OP']);
+    expect(series.find((s) => s.code === 'NORMAL_OP')?.prefix).toBe('N');
+    expect(series.find((s) => s.code === 'SPECIAL_OP')?.startAt).toBe(101);
+
+    const policies = await prisma.queuePolicy.findMany({ where: { clinicId: clinic.id } });
+    expect(policies).toHaveLength(1);
+    expect(policies[0].doctorId).toBeNull();
+  });
+
+  /**
+   * `POST /admin/staff` is own-clinic-only, which left a new clinic unable to
+   * ever get its first admin. The bootstrap route widens scope to the caller's
+   * HOSPITAL — and no further.
+   */
+  it('bootstraps the first admin of a new clinic, but not across hospitals', async () => {
+    const clinic = (await (
+      await adminFetch('/admin/clinics', {
+        method: 'POST',
+        body: JSON.stringify({ name: 'Needs An Admin' }),
+      })
+    ).json()) as { id: string };
+    createdClinicIds.push(clinic.id);
+
+    const username = `boot-admin-${Date.now()}`;
+    const made = await adminFetch(`/admin/clinics/${clinic.id}/staff`, {
+      method: 'POST',
+      body: JSON.stringify({ name: 'Bootstrap Admin', role: 'ADMIN', username, password: 'secret123' }),
+    });
+    expect(made.status).toBe(201);
+    const staff = (await made.json()) as { id: string; clinicId: string; role: string };
+    expect(staff.clinicId).toBe(clinic.id);
+    expect(staff.role).toBe('ADMIN');
+
+    // and the account genuinely works
+    const login = await fetch(`${url}/auth/staff/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ username, password: 'secret123' }),
+    });
+    expect(login.status).toBe(201);
+
+    // A clinic in ANOTHER hospital reads as not-found — the scope widened to the
+    // caller's hospital, not to every clinic. (CLINIC_B is in the SAME hospital,
+    // so it would legitimately succeed; a foreign one is needed to prove this.)
+    const foreignHospital = `mgmt-foreign-hosp-${Date.now()}`;
+    const foreignClinic = `mgmt-foreign-clinic-${Date.now()}`;
+    await prisma.hospital.create({ data: { id: foreignHospital, name: 'Foreign Hosp' } });
+    await prisma.clinic.create({
+      data: { id: foreignClinic, hospitalId: foreignHospital, name: 'Foreign Clinic' },
+    });
+    try {
+      const foreign = await adminFetch(`/admin/clinics/${foreignClinic}/staff`, {
+        method: 'POST',
+        body: JSON.stringify({ name: 'Nope', role: 'ADMIN', username: `x-${Date.now()}`, password: 'secret123' }),
+      });
+      expect(foreign.status).toBe(404);
+      expect(await prisma.staff.count({ where: { clinicId: foreignClinic } })).toBe(0);
+    } finally {
+      await prisma.clinic.deleteMany({ where: { id: foreignClinic } });
+      await prisma.hospital.deleteMany({ where: { id: foreignHospital } });
+    }
+  });
+
   it('doctor: stores photoUrl and rejects non-positive fee', async () => {
     const ok = await newDoctor({ name: 'Dr Photo', consultationFee: 500, photoUrl: 'https://x/p.png' });
     expect(ok.status).toBe(201);

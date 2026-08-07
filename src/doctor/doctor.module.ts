@@ -3,6 +3,7 @@ import { QueueEngineModule } from '../queue-engine/queue-engine.module';
 import { ConsultationNotesModule } from '../consultation-notes/consultation-notes.module';
 import { DoctorController } from './doctor.controller';
 import { DoctorService } from './doctor.service';
+import { OpQueueCompatService } from './op-queue-compat.service';
 
 // Doctor Dashboard — read surface for a doctor's own live session. Reuses the
 // Queue Engine (EtaService + QueueService) for ordering/ETA; mutations stay on
@@ -11,6 +12,6 @@ import { DoctorService } from './doctor.service';
 @Module({
   imports: [QueueEngineModule, ConsultationNotesModule],
   controllers: [DoctorController],
-  providers: [DoctorService],
+  providers: [DoctorService, OpQueueCompatService],
 })
 export class DoctorModule {}

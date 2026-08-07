@@ -10,6 +10,7 @@ import {
   DoctorQueueView,
   toDoctorQueueEntry,
 } from './doctor.dto';
+import { OpQueueCompatService } from './op-queue-compat.service';
 
 /**
  * Doctor-facing read surface. The doctor only ever sees their OWN session
@@ -25,6 +26,7 @@ export class DoctorService {
     private readonly prisma: PrismaService,
     private readonly queue: QueueService,
     private readonly eta: EtaService,
+    private readonly opQueue: OpQueueCompatService,
   ) {}
 
   /** Server-local calendar date (YYYY-MM-DD) — matches how sessions are keyed. */
@@ -62,6 +64,13 @@ export class DoctorService {
   ): Promise<DoctorQueueView> {
     const sessionDate = this.today();
     const session: SessionKey = { doctorId, sessionDate, sessionType };
+
+    // Read cutover (reversible, per clinic): serve the same shape from the new
+    // projection when this clinic is flipped. Must move together with the
+    // roster and patientStatus flags — see OpQueueCompatService.
+    if (await this.opQueue.enabled(doctorId)) {
+      return this.opQueue.queue(doctorId, sessionType, sessionDate);
+    }
 
     const ordered = await this.eta.etaForQueue(session);
 

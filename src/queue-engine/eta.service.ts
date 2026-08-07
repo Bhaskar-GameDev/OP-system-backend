@@ -30,7 +30,8 @@ export class EtaService {
     private readonly queue: QueueService,
   ) {}
 
-  private async avgConsultMinutes(doctorId: string): Promise<number> {
+  /** Public so the cutover's new-model queue read computes ETA identically. */
+  async avgConsultMinutes(doctorId: string): Promise<number> {
     const doctor = await this.prisma.doctor.findUnique({
       where: { id: doctorId },
       select: { avgConsultMinutes: true },

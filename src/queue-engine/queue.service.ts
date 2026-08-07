@@ -83,6 +83,10 @@ end
 local tokenSeq = redis.call('INCR', KEYS[1])
 local score = redis.call('INCR', KEYS[2])
 local token = ARGV[1] .. string.format('%0' .. ARGV[2] .. 'd', tokenSeq)
+-- ARGV[5] = externally minted display token (OP cutover). The counter is still
+-- INCR'd above so the legacy sequence stays dense and tokenBaselineFor keeps
+-- working if a later enqueue mints its own number.
+if ARGV[5] ~= '' then token = ARGV[5] end
 redis.call('ZADD', KEYS[3], score, token)
 if ARGV[3] ~= '' then redis.call('HSET', KEYS[4], token, ARGV[3]) end
 local card = redis.call('ZCARD', KEYS[3])
@@ -286,12 +290,18 @@ export class QueueService {
    * Atomically issue a token AND place it in the merged ordered queue.
    * If bookingId is given it is mapped to the token (for later DB updates).
    * `isFront` is true when the queue was empty and this entry is now rank 0.
+   *
+   * `displayToken` overrides the minted number with one the OP engine already
+   * issued for this visit, so a dual-written patient carries ONE number across
+   * both engines instead of a legacy W001 next to an OP N001. The returned
+   * `tokenSequence` stays the legacy counter's — only the display string changes.
    */
   async enqueue(
     source: TokenSource,
     session: SessionKey,
     bookingId = '',
     tokenBaseline = 0,
+    displayToken = '',
   ): Promise<QueueEntry> {
     this.ensureCommand();
 
@@ -308,6 +318,7 @@ export class QueueService {
           pad: string,
           bookingId: string,
           tokenBaseline: string,
+          displayToken: string,
         ) => Promise<[number, number, string, number]>;
       }
     ).pfosEnqueue.bind(this.redisService.redis);
@@ -321,6 +332,7 @@ export class QueueService {
       String(TOKEN_PAD),
       bookingId,
       tokenBaseline > 0 ? String(tokenBaseline) : '',
+      displayToken,
     );
 
     return {
