@@ -39,6 +39,16 @@ export type PriorityInsertOutcome =
   | { status: 'PRECISION' } // midpoint collided with a bound (float exhaustion)
   | { status: 'OK'; token: string; score: number; isFront: boolean };
 
+/**
+ * Result of moving an ALREADY-QUEUED token into the priority slot. `FRONT` means
+ * the token is the active patient, so there is nothing to jump ahead of.
+ */
+export type PriorityMoveOutcome =
+  | { status: 'GONE' } // token is not in the live queue (never queued / no-show)
+  | { status: 'PRECISION' } // midpoint collided with a bound (float exhaustion)
+  | { status: 'FRONT'; score: number } // already rank 0 — left untouched
+  | { status: 'OK'; score: number };
+
 /** Result of an atomic reinsert-after-token. */
 export type ReinsertOutcome =
   | { status: 'GONE' } // anchor token no longer in queue
@@ -213,6 +223,34 @@ return { 'OK', token, tostring(score), isFront }
 `;
 
 /**
+ * Atomic PRIORITY MOVE of a token that is ALREADY in the queue: re-score it to
+ * midpoint(activeScore, firstWaitingScore) so it becomes the first waiter,
+ * KEEPING its existing number. ZADD on an existing member updates the score in
+ * place, so the patient is never duplicated and never renumbered.
+ *
+ * Used when reception prioritises someone who is already queued; a booking with
+ * no live token still goes through PRIORITY_LUA (fresh token minted).
+ *
+ * KEYS[1] queue   ARGV[1] token
+ * returns {'GONE'} | {'FRONT', scoreStr} | {'PRECISION'} | {'OK', scoreStr}
+ */
+const PRIORITY_MOVE_LUA = `
+local cur = redis.call('ZSCORE', KEYS[1], ARGV[1])
+if cur == false then return { 'GONE' } end
+local top = redis.call('ZRANGE', KEYS[1], 0, 1, 'WITHSCORES')
+-- rank 0: the active patient, already ahead of everyone
+if top[1] == ARGV[1] then return { 'FRONT', cur } end
+-- rank 1: already the first waiter, nothing to gain from re-scoring
+if #top >= 3 and top[3] == ARGV[1] then return { 'OK', cur } end
+local activeScore = tonumber(top[2])
+local upper = tonumber(top[4])
+local score = (activeScore + upper) / 2
+if score <= activeScore or score >= upper then return { 'PRECISION' } end
+redis.call('ZADD', KEYS[1], score, ARGV[1])
+return { 'OK', tostring(score) }
+`;
+
+/**
  * Atomic REINSERT after an existing in-queue token. Score = midpoint(anchorScore,
  * nextMemberScore). Rejects if the token is already present, or the anchor is
  * gone by the time it runs.
@@ -263,6 +301,10 @@ export class QueueService {
     this.redisService.defineCommand('pfosPriority', {
       numberOfKeys: 4,
       lua: PRIORITY_LUA,
+    });
+    this.redisService.defineCommand('pfosPriorityMove', {
+      numberOfKeys: 1,
+      lua: PRIORITY_MOVE_LUA,
     });
     this.redisService.defineCommand('pfosReinsert', {
       numberOfKeys: 2,
@@ -450,6 +492,28 @@ export class QueueService {
       score: Number(res[2]),
       isFront: Number(res[3]) === 1,
     };
+  }
+
+  /**
+   * Atomic move of an already-queued token into the priority slot, keeping its
+   * number. See PRIORITY_MOVE_LUA.
+   */
+  async priorityMove(
+    token: string,
+    session: SessionKey,
+  ): Promise<PriorityMoveOutcome> {
+    this.ensureCommand();
+    const run = (
+      this.redisService.redis as unknown as {
+        pfosPriorityMove: (queueKey: string, token: string) => Promise<string[]>;
+      }
+    ).pfosPriorityMove.bind(this.redisService.redis);
+
+    const res = await run(this.queueKey(session), token);
+    if (res[0] === 'GONE') return { status: 'GONE' };
+    if (res[0] === 'PRECISION') return { status: 'PRECISION' };
+    if (res[0] === 'FRONT') return { status: 'FRONT', score: Number(res[1]) };
+    return { status: 'OK', score: Number(res[1]) };
   }
 
   /** Atomic reinsert of a token after an existing anchor token. */

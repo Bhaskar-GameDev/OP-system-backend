@@ -117,6 +117,26 @@ describe('ConsultationService — skip / priority / reinsert (real Redis + Postg
     return b.status;
   }
 
+  async function tokenOf(id: string): Promise<string | null> {
+    const b = await prisma.booking.findUniqueOrThrow({ where: { id } });
+    return b.tokenNumber;
+  }
+
+  /**
+   * Enqueue AND write the token back onto the booking — what the real callers
+   * (payment-confirm, walk-in, voice) do. Priority treats a booking carrying a
+   * live token as "already queued".
+   */
+  async function enqueueBooked(source: TokenSource): Promise<string> {
+    const id = await makeBooking(source);
+    const entry = await consult.enqueueBooking(source, session, id);
+    await prisma.booking.update({
+      where: { id },
+      data: { tokenNumber: entry.tokenNumber },
+    });
+    return id;
+  }
+
   // ── SKIP ───────────────────────────────────────────────
   it('skip ACTIVE: token goes to back, reverts to BOOKED, next promoted', async () => {
     const idA = await enqueue(TokenSource.APP); // A001 active
@@ -191,6 +211,60 @@ describe('ConsultationService — skip / priority / reinsert (real Redis + Postg
     const list = await queueService.list(session);
     // active, then NEWEST priority (p2), then earlier priority (p1)
     expect(list).toEqual(['A001', p2.token, p1.token]);
+  });
+
+  it('priority on an ALREADY-QUEUED patient keeps their token, no duplicate row', async () => {
+    await enqueueBooked(TokenSource.APP); // A001 active
+    await enqueueBooked(TokenSource.WALK_IN); // W001 waiting
+    const idC = await enqueueBooked(TokenSource.VOICE); // A002 last (target)
+
+    const res = await consult.priorityInsert(TokenSource.VOICE, session, idC);
+
+    // same number the patient was already told — nothing minted
+    expect(res.token).toBe('A002');
+    expect(await tokenOf(idC)).toBe('A002');
+    expect(res.isActive).toBe(false);
+
+    const list = await queueService.list(session);
+    expect(list).toEqual(['A001', 'A002', 'W001']); // bumped ahead of W001
+    expect(new Set(list).size).toBe(list.length); // no duplicate entry
+  });
+
+  it('priority on the ACTIVE patient is a no-op (already at the front)', async () => {
+    const idA = await enqueueBooked(TokenSource.APP); // A001 active
+    await enqueueBooked(TokenSource.WALK_IN); // W001
+
+    const res = await consult.priorityInsert(TokenSource.APP, session, idA);
+
+    expect(res.token).toBe('A001');
+    expect(res.isActive).toBe(true);
+    expect(await queueService.list(session)).toEqual(['A001', 'W001']);
+    expect(await statusOf(idA)).toBe(BookingStatus.ACTIVE);
+  });
+
+  it('priority on a booking with no live token mints one AND writes it back', async () => {
+    await enqueueBooked(TokenSource.APP); // A001 active
+    const idP = await makeBooking(TokenSource.WALK_IN); // never queued
+
+    const res = await consult.priorityInsert(TokenSource.WALK_IN, session, idP);
+
+    // the roster joins queue rows to bookings by token — this write is what
+    // stopped the priority row from rendering blank
+    expect(await tokenOf(idP)).toBe(res.token);
+    expect(await queueService.list(session)).toEqual(['A001', res.token]);
+  });
+
+  it('priority re-queues a NO_SHOW booking under a fresh token', async () => {
+    await enqueueBooked(TokenSource.APP); // A001 active
+    const idB = await enqueueBooked(TokenSource.WALK_IN); // W001
+    await consult.markNoShow(session, 'W001'); // leaves the queue
+
+    const res = await consult.priorityInsert(TokenSource.WALK_IN, session, idB);
+
+    expect(res.token).not.toBe('W001'); // old number is gone from the queue
+    expect(await tokenOf(idB)).toBe(res.token);
+    const list = await queueService.list(session);
+    expect(list).toEqual(['A001', res.token]);
   });
 
   // ── REINSERT ───────────────────────────────────────────

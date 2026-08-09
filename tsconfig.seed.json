@@ -10,10 +10,13 @@
   // Kept as a SEPARATE config rather than widening the base `include`, because
   // the base config feeds the build output path and pulling a standalone CLI
   // script into it changes what gets compiled into dist/.
+  //
+  // `scripts/` is in here for the same reason: those are ts-node CLI entrypoints
+  // outside the base `include`, so nothing typechecked them either.
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "noEmit": true
   },
-  "include": ["prisma/**/*.ts", "src/**/*"],
+  "include": ["prisma/**/*.ts", "scripts/**/*.ts", "src/**/*"],
   "exclude": ["node_modules", "dist"]
 }

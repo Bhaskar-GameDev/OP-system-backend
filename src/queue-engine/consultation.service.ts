@@ -389,9 +389,17 @@ export class ConsultationService {
   }
 
   /**
-   * Emergency-priority insert of a NEW booking just behind the active patient
-   * (ahead of any previously-prioritized but still-waiting patient). If the
-   * queue is empty it becomes ACTIVE immediately, like enqueueBooking.
+   * Emergency priority for a booking: it ends up just behind the active patient
+   * (ahead of any previously-prioritized but still-waiting patient).
+   *
+   * Two cases, because reception uses this button for both:
+   *  - the booking is ALREADY in the live queue (the common case — a waiting
+   *    patient is bumped up): the existing token is re-scored in place. Same
+   *    number, no duplicate row, DB untouched.
+   *  - the booking has no live token (emergency walk-in that was never queued,
+   *    or one whose token has left the queue): a fresh token is minted and
+   *    written back to the booking, so the roster can still join queue rows to
+   *    a patient. Empty queue -> ACTIVE immediately, like enqueueBooking.
    */
   async priorityInsert(
     source: TokenSource,
@@ -399,6 +407,33 @@ export class ConsultationService {
     bookingId: string,
   ): Promise<PriorityResult> {
     return this.withSessionLock(session, async () => {
+      const booking = await this.prisma.booking.findUnique({
+        where: { id: bookingId },
+        select: { tokenNumber: true },
+      });
+      if (!booking) throw new NotFoundException(`booking ${bookingId} not found`);
+
+      const existingToken = booking.tokenNumber;
+      if (existingToken) {
+        const moved = await this.queue.priorityMove(existingToken, session);
+        if (moved.status === 'PRECISION') {
+          throw new ConflictException(
+            'priority score precision exhausted for this gap; renormalization needed',
+          );
+        }
+        if (moved.status !== 'GONE') {
+          this.events.sessionChanged(session);
+          return {
+            token: existingToken,
+            score: moved.score,
+            isActive: moved.status === 'FRONT',
+          };
+        }
+        // GONE: the old number is no longer queued (no-show/completed). Drop its
+        // stale map entry before a fresh token takes over below.
+        await this.queue.unmapToken(existingToken, session);
+      }
+
       const baseline = await this.tokenBaselineFor(source, session);
       const res = await this.queue.priorityInsert(
         source,
@@ -411,6 +446,13 @@ export class ConsultationService {
           'priority score precision exhausted for this gap; renormalization needed',
         );
       }
+      // Persist the minted number like every other enqueue path does, so the
+      // roster/history join by token finds this patient (and the cold-start
+      // token baseline still sees it after a Redis wipe).
+      await this.prisma.booking.updateMany({
+        where: { id: bookingId },
+        data: { tokenNumber: res.token },
+      });
       if (res.isFront) {
         await this.promote(res.token, session);
       }
