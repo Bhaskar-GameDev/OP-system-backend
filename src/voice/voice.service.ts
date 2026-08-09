@@ -13,7 +13,6 @@ import {
   PaymentStatus,
   Prisma,
   RegistrationSource,
-  SessionType,
 } from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { SessionResolverService } from '../bookings/session-resolver.service';
@@ -107,42 +106,53 @@ export class VoiceService {
     for (const d of doctors) {
       if (specialty && !(d.specialization ?? '').toLowerCase().includes(specialty)) continue;
 
-      const today = await this.resolver.resolveToday(d.id);
-      if (today.status !== 'OPEN') continue;
-      const s = today.session;
-      if (req.sessionType && s.sessionType !== req.sessionType) continue;
+      // Per-doctor isolation: this loop touches the session resolver, Redis and
+      // the config engine once per doctor. One doctor with a broken schedule (or
+      // a Redis blip on their queue key) must not blank the whole clinic's
+      // availability — the caller would be told "nothing today" when four other
+      // doctors are open. Skip the bad one, serve the rest.
+      try {
+        const today = await this.resolver.resolveToday(d.id);
+        if (today.status !== 'OPEN') continue;
+        const s = today.session;
+        if (req.sessionType && s.sessionType !== req.sessionType) continue;
 
-      sessionDate = s.sessionDate;
-      const session: SessionKey = {
-        doctorId: d.id,
-        sessionDate: s.sessionDate,
-        sessionType: s.sessionType,
-      };
-      // A new joiner lands at the back: their wait = current queue size × avg.
-      // Read cutover (reversible, per-clinic): when flipped, count the NEW engine's
-      // live queue for this doctor instead of the legacy queue. Aggregate only, so
-      // no per-caller token divergence — the agent just quotes an accurate wait.
-      let waiting = await this.queue.size(session);
-      if (
-        await this.config.get(
-          'reads.cutover.voiceAvailability',
-          { clinicId: clinic.id },
-          false,
-        )
-      ) {
-        waiting = await this.prisma.queueReadModel.count({
-          where: { doctorId: d.id, status: EncounterStatus.WAITING },
+        sessionDate = s.sessionDate;
+        const session: SessionKey = {
+          doctorId: d.id,
+          sessionDate: s.sessionDate,
+          sessionType: s.sessionType,
+        };
+        // A new joiner lands at the back: their wait = current queue size × avg.
+        // Read cutover (reversible, per-clinic): when flipped, count the NEW engine's
+        // live queue for this doctor instead of the legacy queue. Aggregate only, so
+        // no per-caller token divergence — the agent just quotes an accurate wait.
+        let waiting = await this.queue.size(session);
+        if (
+          await this.config.get(
+            'reads.cutover.voiceAvailability',
+            { clinicId: clinic.id },
+            false,
+          )
+        ) {
+          waiting = await this.prisma.queueReadModel.count({
+            where: { doctorId: d.id, status: EncounterStatus.WAITING },
+          });
+        }
+        out.push({
+          doctorId: d.id,
+          doctorName: d.name,
+          specialization: d.specialization,
+          consultationFee: d.consultationFee,
+          sessions: [
+            { sessionType: s.sessionType, waiting, etaMinutes: waiting * d.avgConsultMinutes },
+          ],
         });
+      } catch (err) {
+        this.logger.warn(
+          `availability skipped doctor ${d.id} at clinic ${clinic.id}: ${(err as Error).message}`,
+        );
       }
-      out.push({
-        doctorId: d.id,
-        doctorName: d.name,
-        specialization: d.specialization,
-        consultationFee: d.consultationFee,
-        sessions: [
-          { sessionType: s.sessionType, waiting, etaMinutes: waiting * d.avgConsultMinutes },
-        ],
-      });
     }
 
     return {
@@ -248,12 +258,6 @@ export class VoiceService {
       select: { id: true },
     });
 
-    const session: SessionKey = {
-      doctorId: req.doctorId,
-      sessionDate: resolved.sessionDate,
-      sessionType: resolved.sessionType,
-    };
-
     // OP cutover: the token-based OP engine is now the source of truth for the
     // token, so raise it there (register -> check-in -> issue token -> enqueue)
     // instead of the legacy queue engine. `present: true` runs the same
@@ -279,23 +283,39 @@ export class VoiceService {
     }
     const tokenNumber = op.token.displayNumber;
 
-    // Unpaid Payment (status CREATED) = amount due at the desk; link it on.
-    const payment = await this.prisma.payment.create({
-      data: {
-        bookingId: booking.id,
-        amount: doctor.consultationFee * 100, // paise, matching the paid path
-        status: PaymentStatus.CREATED,
-      },
-      select: { id: true },
-    });
-    // Mirror the OP token onto the legacy Booking so lookup/cancel still read a
-    // single, consistent number (the legacy row is kept only as the correlation
-    // record + refund/audit anchor; it no longer mints its own token).
-    const updated = await this.prisma.booking.update({
-      where: { id: booking.id },
-      data: { tokenNumber, paymentId: payment.id },
-      select: { id: true, tokenNumber: true, status: true },
-    });
+    // Everything below this line is bookkeeping on the LEGACY row — the OP token
+    // above is already issued and enqueued, and it is what the doctor and
+    // reception screens render. So a failure here must NOT fail the caller:
+    // throwing would tell them "sorry, couldn't book" while they silently hold a
+    // real place in a real queue, which is the worst possible outcome. Log it
+    // loudly for desk reconciliation and confirm the token they actually have.
+    let bookingStatus: BookingStatus = BookingStatus.BOOKED;
+    try {
+      // Unpaid Payment (status CREATED) = amount due at the desk; link it on.
+      const payment = await this.prisma.payment.create({
+        data: {
+          bookingId: booking.id,
+          amount: doctor.consultationFee * 100, // paise, matching the paid path
+          status: PaymentStatus.CREATED,
+        },
+        select: { id: true },
+      });
+      // Mirror the OP token onto the legacy Booking so lookup/cancel still read a
+      // single, consistent number (the legacy row is kept only as the correlation
+      // record + refund/audit anchor; it no longer mints its own token).
+      const updated = await this.prisma.booking.update({
+        where: { id: booking.id },
+        data: { tokenNumber, paymentId: payment.id },
+        select: { status: true },
+      });
+      bookingStatus = updated.status;
+    } catch (err) {
+      this.logger.error(
+        `token ${tokenNumber} issued but legacy booking ${booking.id} bookkeeping failed ` +
+          `(patient ${req.patientPhone}, doctor ${req.doctorId}) — collect the fee at the desk: ` +
+          `${(err as Error).message}`,
+      );
+    }
 
     // The caller has no app, so this SMS is their ONLY durable record of the
     // token — they otherwise have a number a synthetic voice said once, possibly
@@ -311,13 +331,13 @@ export class VoiceService {
     });
 
     return {
-      bookingId: updated.id,
+      bookingId: booking.id,
       tokenNumber,
       doctorId: req.doctorId,
       doctorName: doctor.name,
       sessionDate: resolved.sessionDate,
       sessionType: resolved.sessionType,
-      status: updated.status,
+      status: bookingStatus,
     };
   }
 
@@ -541,7 +561,27 @@ export class VoiceService {
   }
 
   // ── call log ──────────────────────────────────────────────────────────────
-  async saveCallLog(req: VoiceCallLogRequest): Promise<{ ok: true }> {
+  /**
+   * Telemetry write at the end of a call — transcript, slots, outcome.
+   *
+   * NEVER throws. It runs during the agent's teardown, after the caller has
+   * already been told their token, so failing it can only produce noise: the
+   * agent's own catch would log a second error and nothing about the booking
+   * changes. `ok: false` says the line was lost without pretending it was
+   * written.
+   */
+  async saveCallLog(req: VoiceCallLogRequest): Promise<{ ok: boolean }> {
+    try {
+      return await this.writeCallLog(req);
+    } catch (err) {
+      this.logger.error(
+        `call log write failed for ${req.callSid}: ${(err as Error).message}`,
+      );
+      return { ok: false };
+    }
+  }
+
+  private async writeCallLog(req: VoiceCallLogRequest): Promise<{ ok: true }> {
     const clinicId = req.didNumber
       ? (await this.prisma.voiceNumber.findUnique({
           where: { didNumber: req.didNumber },

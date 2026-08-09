@@ -2,6 +2,7 @@ import { Global, Module } from '@nestjs/common';
 import { AuthTokenService } from './auth-token.service';
 import { AuthService } from './auth.service';
 import { RefreshTokenService } from './refresh-token.service';
+import { LoginThrottleService } from './login-throttle.service';
 import { OtpService } from './otp.service';
 import { PasswordService } from './password.service';
 import { Msg91SmsSender, SMS_SENDER } from './sms.sender';
@@ -18,6 +19,7 @@ import { AuthController } from './auth.controller';
     AuthTokenService,
     AuthService,
     RefreshTokenService,
+    LoginThrottleService,
     OtpService,
     PasswordService,
     JwtAuthGuard,

@@ -64,6 +64,11 @@ describe('Payment failure webhook + pending-payment cleanup (real Redis + Postgr
   const CLINIC_ID = 'pf-clinic';
   const DOCTOR_ID = 'pf-doctor';
   const PATIENT_ID = 'pf-patient';
+  // Extra patients so each booking in a test belongs to a DIFFERENT person.
+  // Per-patient booking limits (P0-8) allow only one live booking per
+  // doctor-session, and this suite previously reused one patient purely as a
+  // fixture shortcut. The webhook behaviour under test is unchanged.
+  const PATIENT_IDS = ['pf-patient', 'pf-patient-2', 'pf-patient-3'];
   const FEE = 500;
   let paySeq = 0;
 
@@ -93,12 +98,16 @@ describe('Payment failure webhook + pending-payment cleanup (real Redis + Postgr
         daysOfWeek: [0, 1, 2, 3, 4, 5, 6],
       },
     });
-    await prisma.patient.create({ data: { id: PATIENT_ID, name: 'PF', mobile: '7000000123' } });
+    for (const [i, id] of PATIENT_IDS.entries()) {
+      await prisma.patient.create({
+        data: { id, name: `PF${i}`, mobile: `700000012${i + 3}` },
+      });
+    }
   });
 
   afterAll(async () => {
     await clean();
-    await prisma.patient.deleteMany({ where: { id: PATIENT_ID } });
+    await prisma.patient.deleteMany({ where: { id: { in: PATIENT_IDS } } });
     await prisma.doctor.deleteMany({ where: { id: DOCTOR_ID } });
     await prisma.clinic.deleteMany({ where: { id: CLINIC_ID } });
     await app.close();
@@ -109,10 +118,16 @@ describe('Payment failure webhook + pending-payment cleanup (real Redis + Postgr
     await prisma.booking.deleteMany({ where: { doctorId: DOCTOR_ID } });
   }
 
+  // Each test starts with no live bookings, so the per-patient limit measures
+  // only what the test itself creates.
+  beforeEach(clean);
+
   /** Initiate a real booking (PENDING_PAYMENT + a CREATED payment + order). */
-  async function initiate(): Promise<{ bookingId: string; orderId: string }> {
+  async function initiate(
+    patientId: string = PATIENT_ID,
+  ): Promise<{ bookingId: string; orderId: string }> {
     const res = await payments.initiateBooking({
-      patientId: PATIENT_ID,
+      patientId,
       doctorId: DOCTOR_ID,
       source: BookingSource.APP,
     });
@@ -188,8 +203,10 @@ describe('Payment failure webhook + pending-payment cleanup (real Redis + Postgr
     beforeAll(clean);
 
     it('expires a pending booking older than the cutoff, leaves a fresh one', async () => {
-      const stale = await initiate();
-      const fresh = await initiate();
+      // Two DIFFERENT patients: one patient may not hold two live bookings in
+      // the same doctor-session (P0-8).
+      const stale = await initiate(PATIENT_IDS[0]);
+      const fresh = await initiate(PATIENT_IDS[1]);
 
       // age the stale booking past the 30-minute cutoff
       await prisma.booking.update({

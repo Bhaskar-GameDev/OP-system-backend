@@ -3,7 +3,6 @@ import { Test } from '@nestjs/testing';
 import { BookingSource, EncounterStatus, TokenResetPolicy } from '@prisma/client';
 import { AppModule } from '../src/app.module';
 import { PrismaService } from '../src/common/prisma/prisma.service';
-import { RedisService } from '../src/common/redis/redis.service';
 import { PaymentsService } from '../src/payments/payments.service';
 import { QueueService } from '../src/queue-engine/queue.service';
 import { SessionKey } from '../src/queue-engine/token.service';
@@ -18,7 +17,6 @@ import { FakeRazorpayGateway, RAZORPAY_GATEWAY } from '../src/payments/razorpay.
 describe('Dual-write: payments.confirm mirrors an APP booking into the new engine', () => {
   let app: INestApplication;
   let prisma: PrismaService;
-  let redis: RedisService;
   let payments: PaymentsService;
   let queue: QueueService;
 
@@ -45,7 +43,6 @@ describe('Dual-write: payments.confirm mirrors an APP booking into the new engin
     app = moduleRef.createNestApplication({ logger: false });
     await app.init();
     prisma = app.get(PrismaService);
-    redis = app.get(RedisService);
     payments = app.get(PaymentsService);
     queue = app.get(QueueService);
     session = { doctorId: DOCTOR, sessionDate: todayYmd(), sessionType: 'MORNING' };

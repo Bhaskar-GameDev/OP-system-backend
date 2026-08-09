@@ -73,9 +73,10 @@ services:
       # Public origin(s). The desktop apps use tauri.localhost; the patient
       # native app sends no Origin. Add hosted web origins here if any.
       CORS_ORIGINS: "https://${DOMAIN},http://tauri.localhost,https://tauri.localhost"
-      # Seed demo data on first start (idempotent). Set SEED_ON_START=false in
-      # .env.production once you have real data you don't want demo rows beside.
-      SEED_ON_START: ${SEED_ON_START:-true}
+      # Demo seeding is OFF and must stay off. The seed creates staff accounts
+      # with documented passwords and deletes live bookings; the backend refuses
+      # to start if this is ever set to true under NODE_ENV=production.
+      SEED_ON_START: "false"
       # Shared secret for the server-to-server /voice/* API; must match the voice
       # agent's VOICE_INTERNAL_SECRET. Blank leaves /voice/* fail-closed (401),
       # which is the right default until the agent is actually deployed.

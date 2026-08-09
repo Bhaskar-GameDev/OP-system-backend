@@ -48,7 +48,9 @@ for arg in "$@"; do
     --razorpay-key-secret=*) RZP_KEY_SECRET="${arg#*=}" ;;
     --razorpay-webhook-secret=*) RZP_WEBHOOK_SECRET="${arg#*=}" ;;
     --fcm-path=*)            FCM_PATH="${arg#*=}" ;;
-    --no-seed)               SEED_ON_START="false" ;;
+    # Retained so existing deploy commands keep working; seeding is now always
+    # off for a production deploy, so this flag is a no-op.
+    --no-seed)               : ;;
     -h|--help)
       grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
   esac
@@ -97,7 +99,13 @@ fi
 [ -z "$RZP_KEY_SECRET" ]     && RZP_KEY_SECRET="$(prev RAZORPAY_KEY_SECRET)"
 [ -z "$RZP_WEBHOOK_SECRET" ] && RZP_WEBHOOK_SECRET="$(prev RAZORPAY_WEBHOOK_SECRET)"
 [ -z "$FCM_PATH" ]           && FCM_PATH="$(prev FCM_SERVICE_ACCOUNT_PATH)"
-[ -z "$SEED_ON_START" ]      && { SEED_ON_START="$(prev SEED_ON_START)"; [ -z "$SEED_ON_START" ] && SEED_ON_START="true"; }
+# Demo seeding is never enabled by a production deploy. This script writes a
+# production .env, and the seed creates staff accounts with documented passwords
+# and deletes live bookings — the backend now refuses to start if it is ever
+# true alongside NODE_ENV=production, so writing anything else here would only
+# produce a container that will not boot. Previous values are deliberately NOT
+# carried forward from an earlier .env.production.
+SEED_ON_START="false"
 
 # ── 3. write .env.production ───────────────────────────────────────────────
 log "Writing $ENV_FILE ..."

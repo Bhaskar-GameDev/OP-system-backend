@@ -1,4 +1,4 @@
-import { BadRequestException, Body, Controller, Post } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Ip, Post } from '@nestjs/common';
 import { AuthService } from './auth.service';
 
 interface OtpRequestDto {
@@ -46,19 +46,25 @@ export class AuthController {
     return { ok: true };
   }
 
+  /**
+   * Privileged login. `@Ip()` feeds the brute-force throttle — it reads
+   * `req.ip`, which resolves the real client address through Caddy because
+   * `trust proxy` is enabled in main.ts. Without that it would be the proxy's
+   * address for every request and the per-IP counter would be useless.
+   */
   @Post('staff/login')
-  async staffLogin(@Body() body: LoginDto) {
+  async staffLogin(@Body() body: LoginDto, @Ip() ip: string) {
     if (!body?.username || !body?.password) {
       throw new BadRequestException('username and password are required');
     }
-    return this.auth.staffLogin(body.username, body.password);
+    return this.auth.staffLogin(body.username, body.password, ip);
   }
 
   @Post('doctor/login')
-  async doctorLogin(@Body() body: LoginDto) {
+  async doctorLogin(@Body() body: LoginDto, @Ip() ip: string) {
     if (!body?.username || !body?.password) {
       throw new BadRequestException('username and password are required');
     }
-    return this.auth.doctorLogin(body.username, body.password);
+    return this.auth.doctorLogin(body.username, body.password, ip);
   }
 }

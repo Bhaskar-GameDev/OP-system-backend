@@ -1,0 +1,168 @@
+# RECONCILED WORKFLOW.
+#
+# CI already existed on branch `fix/voice-cutover-and-ci` (commit 33174ba) before
+# the P0 sprint added one. Rather than ship a competing second workflow, this
+# file takes that branch's version as the base — same job shape, same service
+# containers, same env, same step order — and layers on only what the P0 work
+# genuinely added:
+#
+#   * a `db seed` step, because several suites read seeded fixtures
+#   * a `security` job: dependency audit + a regression grep for reintroduced
+#     development fallbacks and retired demo credentials
+#
+# Anything not in that list is deliberately unchanged from 33174ba so merging
+# the two is trivial. See P0_6_SEED_CREDENTIAL_REMEDIATION.md §11.
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+# A newer push to the same branch makes the in-flight run pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # The suite runs against REAL Postgres + Redis, not mocks — token allocation
+    # is a Redis INCR, the concurrency specs assert genuine row contention, and
+    # the per-patient booking limit is a Postgres advisory lock. A fake would
+    # prove nothing. Ports mirror docker-compose.yml (5433 on the host, because
+    # a local Windows Postgres usually owns 5432).
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pfos
+          POSTGRES_PASSWORD: pfos_local_pw
+          POSTGRES_DB: patient_flow_os
+        ports: ['5433:5432']
+        options: >-
+          --health-cmd "pg_isready -U pfos -d patient_flow_os"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://pfos:pfos_local_pw@localhost:5433/patient_flow_os?schema=public
+      REDIS_HOST: localhost
+      REDIS_PORT: 6379
+      NODE_ENV: test
+      # No production secret is referenced anywhere in this workflow.
+      # MSG91_AUTH_KEY, RAZORPAY_* and FCM_* are deliberately UNSET: their
+      # absence selects the development fallbacks, and the P0 guard specs assert
+      # those fallbacks are unreachable when NODE_ENV=production.
+      #
+      # SEED_*_PASSWORD are also unset, so the seed generates random passwords.
+      # No test depends on a seeded credential — the one suite that needs a real
+      # password (login-throttle) creates and owns its own account.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - run: npx prisma generate
+
+      # `migrate deploy`, not `migrate dev`: it applies the committed migrations
+      # and fails on drift instead of inventing a new one.
+      - run: npx prisma migrate deploy
+
+      # Several suites read seeded fixtures (demo clinics, doctors, patients).
+      # NODE_ENV is `test` here, so the seed's own production guard permits it —
+      # and seed-production-guard.spec.ts proves it would refuse otherwise.
+      - name: Seed test data
+        run: npx prisma db seed
+
+      # Reconciled with branch 9356192: its type-aware ESLint config (which
+      # enables no-floating-promises) now supersedes the weaker one added during
+      # the P0 sprint, and `lint:ci` gates on warnings as well as errors.
+      - name: Lint
+        run: npm run lint:ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # tsconfig.json's `include` is ["src/**/*", "test/**/*"], so the normal
+      # typecheck silently skips the entire prisma/ directory — a gap that let
+      # real type errors sit in the seed while CI reported clean. This step
+      # covers prisma/seed.ts explicitly. Verified to fail on an injected error.
+      - name: Typecheck seed
+        run: npm run typecheck:seed
+
+      # Serial: the suites share one database and the Redis token counters, so
+      # parallel workers would collide on both.
+      - name: Test
+        run: npm test -- --runInBand
+
+      - name: Build
+        run: npm run build
+
+  # ── Added by the P0 sprint; no equivalent exists on 33174ba ────────────────
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      # DEPENDENCY AUDIT POLICY — this step GATES the build.
+      #
+      #   CRITICAL or HIGH in a PRODUCTION dependency  -> CI FAILS
+      #   moderate / low in a production dependency    -> reported, does not gate
+      #   anything reachable only from devDependencies -> reported, does not gate
+      #
+      # Rationale for the line, so the next person does not have to guess:
+      # `--omit=dev` scopes the gate to what actually ships in the runtime image.
+      # Build-time tooling (bundlers, CLIs, test runners) cannot be reached by a
+      # request to the running service, and gating on it produces a permanently
+      # red pipeline that people learn to bypass — which protects nothing. The
+      # development advisories are still printed by the reporting step below, so
+      # nothing is hidden; they are triaged, not silently suppressed.
+      #
+      # As of the P1 dependency remediation this passes with 0 critical and
+      # 0 high. If it fails, a production dependency has a new advisory: fix it
+      # or document the exception here. Do NOT add continue-on-error.
+      - name: Audit production dependencies (gates the build)
+        run: npm audit --omit=dev --audit-level=high
+
+      # Full picture including devDependencies. Reporting only, by policy above.
+      - name: Audit all dependencies (report only)
+        continue-on-error: true
+        run: npm audit
+
+      # Regression guard for P0 and P0.6: a hardcoded signing secret or a retired
+      # demo credential must not reappear. test/credential-exposure.spec.ts
+      # covers the same ground inside the suite; this is the cheap outer check
+      # that runs even if the test job is skipped.
+      - name: Check for reintroduced development fallbacks
+        run: |
+          set -e
+          if grep -rn "'dev_secret'" src/ --include=*.ts \
+               | grep -v "production-config.validator" \
+               | grep -v "auth-token.service"; then
+            echo "::error::A dev_secret fallback appeared outside the guarded locations."
+            exit 1
+          fi
+          if grep -rnE "(admin123|reception123|superadmin123|doctor123)" \
+               src/ prisma/ DEMO.md --include=*.ts --include=*.md; then
+            echo "::error::A retired demo credential reappeared."
+            exit 1
+          fi
+          echo "No reintroduced development fallbacks found."

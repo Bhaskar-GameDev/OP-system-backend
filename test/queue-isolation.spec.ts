@@ -35,7 +35,6 @@ describe('Queue + payment scope isolation (real infra)', () => {
   const DATE = '2026-06-20';
 
   let doctorA1 = '';
-  let doctorB = '';
   let staffA1 = '';
   let adminA = '';
   let patientA = '';
@@ -88,7 +87,6 @@ describe('Queue + payment scope isolation (real infra)', () => {
     bookingAId = bookingA.id;
 
     doctorA1 = tokens.sign({ sub: DOC_A1, role: 'DOCTOR', doctorId: DOC_A1, clinicId: CLINIC_A1, hospitalId: HOSP_A });
-    doctorB = tokens.sign({ sub: DOC_B, role: 'DOCTOR', doctorId: DOC_B, clinicId: CLINIC_B1, hospitalId: HOSP_B });
     staffA1 = tokens.sign({ sub: 'qi-staff-a1', role: 'STAFF', clinicId: CLINIC_A1, hospitalId: HOSP_A });
     adminA = tokens.sign({ sub: 'qi-admin-a', role: 'ADMIN', clinicId: CLINIC_A1, hospitalId: HOSP_A });
     patientA = tokens.sign({ sub: PT_A, role: 'PATIENT' });

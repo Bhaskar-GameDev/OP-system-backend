@@ -8,7 +8,16 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { RedisService } from '../common/redis/redis.service';
+import { assertNotProduction } from '../common/config/production-config.validator';
 import { SMS_SENDER, SmsSender } from './sms.sender';
+
+/**
+ * The fixed code used ONLY in development and test, where no SMS provider is
+ * configured. Exported so tests and local tooling reference the constant rather
+ * than hardcoding it, and so its single definition is easy to audit.
+ * `assertNotProduction` guards every path that can select it.
+ */
+export const DEV_OTP_CODE = '000000';
 
 const OTP_TTL_DEFAULT = 300; // 5 min
 const MAX_ATTEMPTS = 5; // wrong guesses before the OTP is burned
@@ -84,8 +93,18 @@ export class OtpService {
       );
     }
 
+    // Production NEVER issues a fixed code. Without this guard a missing
+    // MSG91_AUTH_KEY made '000000' a universal OTP for every account in the
+    // system — and `verifyPatientOtp` upserts by mobile, so any number could be
+    // claimed. The startup validator already requires the key in production;
+    // this is the second lock at the point the code is chosen.
     const devMode = !this.config.get<string>('MSG91_AUTH_KEY');
-    const otp = devMode ? '000000' : String(randomInt(0, 1_000_000)).padStart(6, '0');
+    if (devMode) {
+      assertNotProduction('static development OTP (no MSG91_AUTH_KEY)');
+    }
+    const otp = devMode
+      ? DEV_OTP_CODE
+      : String(randomInt(0, 1_000_000)).padStart(6, '0');
     // store only the hash; reset attempts for the new code
     await redis.set(this.otpKey(mobile), this.hashOtp(otp), 'EX', this.ttl());
     await redis.del(this.attemptsKey(mobile));

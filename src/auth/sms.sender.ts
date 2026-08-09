@@ -1,7 +1,22 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { assertNotProduction } from '../common/config/production-config.validator';
 
 export const SMS_SENDER = Symbol('SMS_SENDER');
+
+/**
+ * Redact a mobile number for logging: keep the last 4 digits only.
+ *
+ * A mobile number is the patient's account identifier in this system, so a full
+ * number in a log line is both an identifier and half of an authentication
+ * factor. The last four are enough to correlate a delivery failure with a
+ * support call; the rest is not ours to write down.
+ */
+export function maskMobile(mobile: string): string {
+  const digits = mobile.replace(/\D/g, '');
+  if (digits.length <= 4) return '****';
+  return `${'*'.repeat(digits.length - 4)}${digits.slice(-4)}`;
+}
 
 /** Sends SMS. Swap the impl (real MSG91 vs test fake) via the SMS_SENDER token. */
 export interface SmsSender {
@@ -29,7 +44,15 @@ export class Msg91SmsSender implements SmsSender {
   async sendOtp(mobile: string, otp: string): Promise<void> {
     const authKey = this.config.get<string>('MSG91_AUTH_KEY');
     if (!authKey) {
-      this.logger.warn(`[DEV] OTP for ${mobile}: ${otp}`);
+      // Development only. In production a missing auth key means OTPs cannot be
+      // delivered, and continuing would leave accounts reachable with whatever
+      // the OTP service generated — so refuse rather than pretend to send.
+      assertNotProduction('MSG91 dev SMS fallback (no MSG91_AUTH_KEY)');
+      // The OTP VALUE is never logged, in any environment. It is a live
+      // credential for the duration of its TTL; a log line is the wrong place
+      // for it, and container logs routinely outlive the code that wrote them.
+      // Developers read the code from the OTP service's documented dev constant.
+      this.logger.warn(`[DEV] OTP generated for ${maskMobile(mobile)} (value not logged)`);
       return;
     }
 
@@ -51,7 +74,7 @@ export class Msg91SmsSender implements SmsSender {
         headers: { authkey: authKey, accept: 'application/json' },
       });
     } catch (err) {
-      this.logger.error(`MSG91 request failed for ${recipient}: ${(err as Error).message}`);
+      this.logger.error(`MSG91 request failed for ${maskMobile(recipient)}: ${(err as Error).message}`);
       throw err;
     }
 
@@ -65,11 +88,11 @@ export class Msg91SmsSender implements SmsSender {
       /* non-JSON body — fall through to status check */
     }
     if (!res.ok || type === 'error') {
-      this.logger.error(`MSG91 rejected OTP for ${recipient}: ${res.status} ${bodyText}`);
+      this.logger.error(`MSG91 rejected OTP for ${maskMobile(recipient)}: ${res.status} ${bodyText}`);
       throw new Error(`MSG91 send failed: ${res.status}`);
     }
 
-    this.logger.log(`OTP dispatched to ${recipient} via MSG91`);
+    this.logger.log(`OTP dispatched to ${maskMobile(recipient)} via MSG91`);
   }
 
   /**
@@ -90,7 +113,7 @@ export class Msg91SmsSender implements SmsSender {
     const recipient = this.normalizeMobile(mobile);
 
     if (!authKey || !templateId) {
-      this.logger.warn(`[DEV] SMS to ${recipient}: ${message}`);
+      this.logger.warn(`[DEV] SMS to ${maskMobile(recipient)}: ${message}`);
       return;
     }
 
@@ -109,7 +132,7 @@ export class Msg91SmsSender implements SmsSender {
         }),
       });
     } catch (err) {
-      this.logger.error(`MSG91 request failed for ${recipient}: ${(err as Error).message}`);
+      this.logger.error(`MSG91 request failed for ${maskMobile(recipient)}: ${(err as Error).message}`);
       throw err;
     }
 
@@ -121,11 +144,11 @@ export class Msg91SmsSender implements SmsSender {
       /* non-JSON body — fall through to status check */
     }
     if (!res.ok || type === 'error') {
-      this.logger.error(`MSG91 rejected SMS for ${recipient}: ${res.status} ${bodyText}`);
+      this.logger.error(`MSG91 rejected SMS for ${maskMobile(recipient)}: ${res.status} ${bodyText}`);
       throw new Error(`MSG91 send failed: ${res.status}`);
     }
 
-    this.logger.log(`SMS dispatched to ${recipient} via MSG91`);
+    this.logger.log(`SMS dispatched to ${maskMobile(recipient)} via MSG91`);
   }
 
   /** Strip formatting and ensure a country code (defaults to India 91). */

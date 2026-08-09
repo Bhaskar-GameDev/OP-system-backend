@@ -1,6 +1,11 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import {
+  isProduction,
+  jwtSecretProblem,
+  ProductionConfigError,
+} from '../common/config/production-config.validator';
 
 export type Role = 'PATIENT' | 'DOCTOR' | 'STAFF' | 'ADMIN';
 
@@ -34,7 +39,36 @@ export class AuthTokenService {
   private readonly secret: string;
 
   constructor(config: ConfigService) {
-    this.secret = config.get<string>('JWT_SECRET', 'dev_secret');
+    const configured = config.get<string>('JWT_SECRET')?.trim();
+
+    // Production has NO fallback. This used to default to 'dev_secret' — a
+    // string published in this repository — which meant a missing JWT_SECRET
+    // produced a fully functional server signing forgeable tokens for every
+    // role. The bootstrap validator already refuses to start in that case; this
+    // is the second lock, so any other entrypoint (worker, script, test harness
+    // run with NODE_ENV=production) fails the same way.
+    if (isProduction()) {
+      const problem = jwtSecretProblem(configured);
+      if (!configured) {
+        throw new ProductionConfigError(
+          'Production configuration validation failed: JWT_SECRET is missing.',
+          ['JWT_SECRET'],
+          [],
+        );
+      }
+      if (problem) {
+        throw new ProductionConfigError(
+          `Production configuration validation failed: ${problem}.`,
+          [],
+          [problem],
+        );
+      }
+    }
+
+    // Development/test only: a deterministic local key so `npm test` and
+    // `npm run start:dev` work without a .env. Unreachable in production by the
+    // guard above.
+    this.secret = configured || 'dev_secret';
   }
 
   sign(claims: SessionClaims, ttlSeconds = 3600): string {

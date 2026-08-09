@@ -1,0 +1,19 @@
+{
+  // Typecheck for prisma/seed.ts.
+  //
+  // The base tsconfig.json has `include: ["src/**/*", "test/**/*"]`, so
+  // `tsc --noEmit -p tsconfig.json` silently skips the entire `prisma/`
+  // directory. That gap let real type errors live in the seed — during the P0.6
+  // work a broken edit sat in seed.ts while the normal typecheck reported clean,
+  // and it was only caught by invoking tsc on the file directly.
+  //
+  // Kept as a SEPARATE config rather than widening the base `include`, because
+  // the base config feeds the build output path and pulling a standalone CLI
+  // script into it changes what gets compiled into dist/.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": ["prisma/**/*.ts", "src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}

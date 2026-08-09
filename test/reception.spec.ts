@@ -23,7 +23,6 @@ describe('Reception check-in (full stack)', () => {
   const DOCTOR_B = 'rc-doc-b';
   const PATIENT = 'rc-patient';
   let bookingA = ''; // belongs to Clinic A
-  let bookingB = ''; // belongs to Clinic B
 
   let staffAToken = '';
   let staffBToken = '';
@@ -65,7 +64,7 @@ describe('Reception check-in (full stack)', () => {
         },
       });
     bookingA = (await mk(DOCTOR_A)).id;
-    bookingB = (await mk(DOCTOR_B)).id;
+    await mk(DOCTOR_B); // clinic B's booking exists so the isolation checks have something to miss
 
     staffAToken = tokens.sign({ sub: 'staff-a', role: 'STAFF', clinicId: CLINIC_A });
     staffBToken = tokens.sign({ sub: 'staff-b', role: 'STAFF', clinicId: CLINIC_B });

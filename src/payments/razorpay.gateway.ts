@@ -1,6 +1,11 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import {
+  assertNotProduction,
+  isProduction,
+  ProductionConfigError,
+} from '../common/config/production-config.validator';
 
 export const RAZORPAY_GATEWAY = Symbol('RAZORPAY_GATEWAY');
 
@@ -34,12 +39,20 @@ export interface RazorpayGateway {
   verifyWebhookSignature(rawBody: string, signature: string): boolean;
 }
 
-/** Constant-time hex-HMAC compare. */
+/**
+ * Constant-time hex-HMAC compare.
+ *
+ * An EMPTY secret fails closed. HMAC with a blank key is still a well-defined,
+ * deterministic value, so an unset RAZORPAY_KEY_SECRET / WEBHOOK_SECRET would
+ * otherwise let anyone who noticed the blank compute a signature that verifies.
+ * Refusing outright is the only safe reading of "no secret configured".
+ */
 export function hmacEquals(
   secret: string,
   payload: string,
   signature: string,
 ): boolean {
+  if (!secret) return false;
   const expected = createHmac('sha256', secret).update(payload).digest('hex');
   const a = Buffer.from(expected);
   const b = Buffer.from(signature);
@@ -55,7 +68,27 @@ export class HttpRazorpayGateway implements RazorpayGateway {
   private readonly base = 'https://api.razorpay.com/v1';
   private readonly logger = new Logger(HttpRazorpayGateway.name);
 
-  constructor(private readonly config: ConfigService) {}
+  constructor(private readonly config: ConfigService) {
+    // In production all three credentials must be present. Key id alone is not
+    // enough: without KEY_SECRET and WEBHOOK_SECRET the two signature checks
+    // would run against an empty key, and `hmacEquals` fails every request
+    // closed — meaning payments would be broken rather than merely insecure.
+    // Failing at construction turns that into a startup error with a name in it.
+    if (isProduction()) {
+      const missing = (
+        ['RAZORPAY_KEY_ID', 'RAZORPAY_KEY_SECRET', 'RAZORPAY_WEBHOOK_SECRET'] as const
+      ).filter((name) => !(this.config.get<string>(name) ?? '').trim());
+      if (missing.length > 0) {
+        throw new ProductionConfigError(
+          `Production configuration validation failed: ${missing.join(', ')} ${
+            missing.length === 1 ? 'is' : 'are'
+          } missing.`,
+          [...missing],
+          [],
+        );
+      }
+    }
+  }
 
   /**
    * Parse a Razorpay JSON response, throwing on a non-2xx so a 4xx/5xx never
@@ -145,6 +178,15 @@ export class HttpRazorpayGateway implements RazorpayGateway {
  */
 @Injectable()
 export class FakeRazorpayGateway implements RazorpayGateway {
+  constructor() {
+    // Hard boundary, enforced at construction rather than at the call site: this
+    // class returns true from both signature checks unconditionally, so a
+    // production instance would accept forged payments and forged webhooks.
+    // Throwing here means no code path — factory, script, test harness run with
+    // NODE_ENV=production — can obtain one.
+    assertNotProduction('FakeRazorpayGateway');
+  }
+
   async createOrder(amountPaise: number, receipt: string): Promise<RpOrder> {
     return { orderId: `order_dev_${receipt}`, amount: amountPaise };
   }

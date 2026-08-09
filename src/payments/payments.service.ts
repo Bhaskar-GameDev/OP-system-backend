@@ -18,6 +18,7 @@ import { ConsultationService } from '../queue-engine/consultation.service';
 import { SessionKey, TokenSource } from '../queue-engine/token.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { SessionResolverService } from '../bookings/session-resolver.service';
+import { BookingLimitService } from '../bookings/booking-limit.service';
 import { OpMirrorService } from '../op-mirror/op-mirror.service';
 import {
   RAZORPAY_GATEWAY,
@@ -55,6 +56,7 @@ export class PaymentsService {
     private readonly notifications: NotificationsService,
     private readonly sessionResolver: SessionResolverService,
     private readonly mirror: OpMirrorService,
+    private readonly bookingLimits: BookingLimitService,
     @Inject(RAZORPAY_GATEWAY) private readonly razorpay: RazorpayGateway,
   ) {}
 
@@ -97,16 +99,33 @@ export class PaymentsService {
 
     const amountPaise = fee * 100;
 
-    const booking = await this.prisma.booking.create({
-      data: {
-        patientId: input.patientId,
-        doctorId: input.doctorId,
-        source: input.source,
-        sessionDate: new Date(sessionDate),
-        sessionType,
-        status: BookingStatus.PENDING_PAYMENT,
-      },
-    });
+    // Abuse protection: one live booking per doctor-session, plus a daily cap
+    // across doctors. Enforced INSIDE a transaction with a per-patient advisory
+    // lock, so two concurrent requests cannot both pass the check. Without it a
+    // single account could create unlimited PENDING_PAYMENT rows — no payment
+    // required — and exhaust every doctor's queue.
+    const booking = await this.prisma.$transaction((tx) =>
+      this.bookingLimits.withLimitsEnforced(
+        tx,
+        {
+          patientId: input.patientId,
+          doctorId: input.doctorId,
+          sessionDate: new Date(sessionDate),
+          sessionType,
+        },
+        (t) =>
+          t.booking.create({
+            data: {
+              patientId: input.patientId,
+              doctorId: input.doctorId,
+              source: input.source,
+              sessionDate: new Date(sessionDate),
+              sessionType,
+              status: BookingStatus.PENDING_PAYMENT,
+            },
+          }),
+      ),
+    );
 
     const order = await this.razorpay.createOrder(amountPaise, booking.id);
 

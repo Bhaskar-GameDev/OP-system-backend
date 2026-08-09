@@ -5,7 +5,6 @@ import { Test } from '@nestjs/testing';
 import { EncounterStatus, SessionType, TokenResetPolicy } from '@prisma/client';
 import { AppModule } from '../src/app.module';
 import { PrismaService } from '../src/common/prisma/prisma.service';
-import { RedisService } from '../src/common/redis/redis.service';
 import { VoiceService } from '../src/voice/voice.service';
 import { QueueService } from '../src/queue-engine/queue.service';
 import { SessionKey } from '../src/queue-engine/token.service';
@@ -27,7 +26,6 @@ import { SessionKey } from '../src/queue-engine/token.service';
 describe('voice.book raises an OP token into the new engine', () => {
   let app: INestApplication;
   let prisma: PrismaService;
-  let redis: RedisService;
   let voice: VoiceService;
   let queue: QueueService;
 
@@ -53,7 +51,6 @@ describe('voice.book raises an OP token into the new engine', () => {
     app = moduleRef.createNestApplication({ logger: false });
     await app.init();
     prisma = app.get(PrismaService);
-    redis = app.get(RedisService);
     voice = app.get(VoiceService);
     queue = app.get(QueueService);
     session = { doctorId: DOCTOR, sessionDate: todayYmd(), sessionType: 'MORNING' };

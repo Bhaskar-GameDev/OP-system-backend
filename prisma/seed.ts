@@ -1,14 +1,19 @@
 /**
- * Demo seed for Patient Flow OS.
+ * Demo seed for Patient Flow OS. DEVELOPMENT AND TEST ONLY.
  *
  * Populates a realistic, demo-ready dataset: 2 clinics, 5 doctors across
- * specialties (ONE continuous session per doctor per day), 12 patients, and a spread of
- * bookings (completed / confirmed / expired) plus matching payments and audit
- * entries so booking history and the audit log are never empty.
+ * specialties (ONE continuous session per doctor per day), 12 patients, and a
+ * spread of bookings (completed / confirmed / expired) plus matching payments
+ * and audit entries so booking history and the audit log are never empty.
  *
- * Login credentials are documented in DEMO.md. Idempotent: every row is upserted
- * by a stable id (patients by their unique mobile), so re-running — which the
- * container does on every start — never creates duplicates.
+ * Credentials: NONE are hardcoded. Passwords are generated per run and printed
+ * once to the developer's terminal, or pinned via SEED_*_PASSWORD. Privileged
+ * account ids are generated too. Nothing in this file is a usable credential.
+ *
+ * Idempotent: rows are upserted by a natural key — staff and doctors by their
+ * unique username, patients by mobile — so re-running never duplicates.
+ *
+ * Refuses to run when NODE_ENV=production. See assertSafeToSeed().
  */
 import {
   PrismaClient,
@@ -23,11 +28,19 @@ import {
 } from '@prisma/client';
 import { DAILY_SESSION_TYPE } from '../src/common/session/daily-session';
 import * as bcrypt from 'bcrypt';
+import { randomBytes, randomUUID } from 'node:crypto';
 
 const prisma = new PrismaClient();
 
-// ── Stable ids (text columns). The first three are referenced by the apps,
-// tests and emulator session — keep them EXACTLY as-is. ───────────────────────
+// ── Ids ──────────────────────────────────────────────────────────────────────
+// Hospitals and clinics keep STABLE ids: HOSPITAL_A's is a production
+// identifier written by migration 20260626130000 and used as a column default,
+// and the clinic ids are referenced by local dev tooling. Neither is a
+// credential-bearing account.
+//
+// PRIVILEGED ACCOUNTS (staff + doctors) no longer have fixed ids. They are
+// generated per install and re-adopted from the database by their unique
+// username, so no privileged account is guessable from this file.
 
 // Hospitals (tenants). HOSPITAL_A's id MUST match the migration backfill id so a
 // fresh migrate+seed keeps Clinic A under the same tenant.
@@ -36,22 +49,110 @@ const HOSPITAL_B = '00000000-0000-0000-0000-0000000000b1'; // Apollo Group
 
 const CLINIC_A = '00000000-0000-0000-0000-000000000001'; // City Care Clinic    @ HOSPITAL_A
 const CLINIC_C = '00000000-0000-0000-0000-000000000013'; // Metro Care Clinic   @ HOSPITAL_A (2nd clinic -> exercises ADMIN multi-clinic scope)
-const STAFF_RECEPTION = '00000000-0000-0000-0000-000000000002';
-const DR_SMITH = '00000000-0000-0000-0000-000000000003';
+// Privileged account ids are GENERATED, never fixed. They used to be
+// '00000000-0000-0000-0000-0000000000XX', which made every privileged demo
+// account guessable in any database this seed had touched. resolveDoctorIdentities()
+// adopts the existing id when a doctor with that username is already present, so
+// re-running the seed stays idempotent without a predictable key.
+let DR_SMITH: string = randomUUID();
 
 const CLINIC_B = '00000000-0000-0000-0000-000000000010'; // Apollo Hospitals    @ HOSPITAL_B
-const STAFF_ADMIN = '00000000-0000-0000-0000-000000000008';
-const SUPER_ADMIN = '00000000-0000-0000-0000-000000000009'; // super-admin (HOSPITAL_A)
-const STAFF_ADMIN_B = '00000000-0000-0000-0000-000000000014'; // admin for HOSPITAL_B
-const STAFF_RECEPTION_B = '00000000-0000-0000-0000-000000000012';
 
-const DR_MEERA = '00000000-0000-0000-0000-000000000004'; // Pediatrics   @ CLINIC_A / HOSPITAL_A
-const DR_ARJUN = '00000000-0000-0000-0000-000000000005'; // ENT          @ CLINIC_A / HOSPITAL_A
-const DR_KAVYA = '00000000-0000-0000-0000-000000000006'; // Orthopedics  @ CLINIC_B / HOSPITAL_B
-const DR_SUNITA = '00000000-0000-0000-0000-000000000007'; // Dermatology  @ CLINIC_B / HOSPITAL_B
+let DR_MEERA: string = randomUUID(); // Pediatrics   @ CLINIC_A / HOSPITAL_A
+let DR_ARJUN: string = randomUUID(); // ENT          @ CLINIC_A / HOSPITAL_A
+let DR_KAVYA: string = randomUUID(); // Orthopedics  @ CLINIC_B / HOSPITAL_B
+let DR_SUNITA: string = randomUUID(); // Dermatology  @ CLINIC_B / HOSPITAL_B
 // Overlapping shape on purpose: HOSPITAL_A also has a Dermatologist with a
 // near-identical name, in its 2nd clinic — so any cross-tenant leak is obvious.
-const DR_SUNITA_A = '00000000-0000-0000-0000-000000000015'; // Dermatology @ CLINIC_C / HOSPITAL_A
+let DR_SUNITA_A: string = randomUUID(); // Dermatology @ CLINIC_C / HOSPITAL_A
+
+/**
+ * Hard refusal to run against production.
+ *
+ * This seed creates staff accounts with documented demo passwords AND issues
+ * `deleteMany` against bookings, booking history, sessions, audit logs, doctors
+ * and clinics. Running it on a live hospital database means predictable
+ * super-admin credentials plus destroyed patient bookings.
+ *
+ * The guard lives HERE, inside the seed itself, rather than only in the Docker
+ * entrypoint or Compose file — the risk is a human typing `npm run db:seed`
+ * against a production DATABASE_URL, and no amount of container configuration
+ * prevents that. There is deliberately NO override flag: nothing this script
+ * does is ever wanted in production.
+ */
+function assertSafeToSeed(): void {
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error(
+      'Refusing to seed: NODE_ENV=production. This seed creates demo accounts with ' +
+        'known passwords and deletes live rows. It must never run against a production ' +
+        'database. If this is a non-production environment, set NODE_ENV appropriately.',
+    );
+  }
+}
+
+/**
+ * Development credential for a seeded account.
+ *
+ * There is NO hardcoded fallback any more. The previous design shipped a fixed
+ * literal password per role, which meant the credential for every privileged
+ * demo account — including a hospital-wide super-admin — was a constant known
+ * to anyone who could read this file, and this file lives in a public
+ * repository. Swapping one fixed string for another would not have fixed it.
+ *
+ * (The old values are deliberately not repeated here: a test asserts that this
+ * file contains none of them, so naming them would defeat the check.)
+ *
+ * Behaviour now:
+ *   - `SEED_*_PASSWORD` set  -> use it. This is the deterministic path, for CI
+ *     and for a developer who wants a stable local login across re-seeds.
+ *   - unset                  -> generate a fresh random password for this run.
+ *
+ * Randomly generated values are collected in `generatedCredentials` and printed
+ * once, at the end of the run, to the developer's terminal only. They are never
+ * written to a file, never committed, and never reachable in production because
+ * `assertSafeToSeed()` stops the script long before this is called.
+ */
+const generatedCredentials: Array<{ account: string; envVar: string; password: string }> = [];
+
+function devPassword(envVar: string, account: string): string {
+  const supplied = (process.env[envVar] ?? '').trim();
+  if (supplied.length > 0) return supplied;
+
+  // 24 bytes of CSPRNG output, base64url. Not memorable by design — a developer
+  // reads it from the summary below or pins one via the environment variable.
+  const generated = randomBytes(24).toString('base64url');
+  generatedCredentials.push({ account, envVar, password: generated });
+  return generated;
+}
+
+/**
+ * Print the credentials generated during this run, once, at the end.
+ *
+ * Deliberately `console.log` from a one-shot CLI script and NOT the application
+ * logger: this must never enter the server's log stream, a log shipper, or any
+ * retained store. It is a message to the human who just typed `npm run db:seed`.
+ *
+ * Doubly guarded on production even though the script cannot reach here in
+ * production — the cost of the check is nothing and the cost of being wrong is
+ * a credential in a production log.
+ */
+function reportGeneratedCredentials(): void {
+  if (process.env.NODE_ENV === 'production') return;
+  if (generatedCredentials.length === 0) {
+    console.log('  Passwords: taken from SEED_*_PASSWORD environment variables.');
+    return;
+  }
+  console.log('');
+  console.log('  ── DEVELOPMENT CREDENTIALS (generated this run) ──────────────');
+  console.log('  Local development only. NOT valid anywhere else, and NOT stored.');
+  console.log('  Re-running the seed generates new ones. To pin a value instead,');
+  console.log('  set the matching environment variable before seeding.');
+  console.log('');
+  for (const c of generatedCredentials) {
+    console.log(`    ${c.account.padEnd(28)} ${c.password}   (pin with ${c.envVar})`);
+  }
+  console.log('  ──────────────────────────────────────────────────────────────');
+}
 
 /** Local calendar date at midnight — matches how sessions are keyed (@db.Date). */
 function today(): Date {
@@ -110,93 +211,78 @@ async function seedClinics(): Promise<void> {
   });
 }
 
+/**
+ * Seeded privileged staff.
+ *
+ * Upserted by USERNAME, not by a hardcoded id. The ids used to be fixed values
+ * of the form `00000000-0000-0000-0000-0000000000XX`, which made every
+ * privileged demo account trivially identifiable — and guessable — in any
+ * database this seed had ever touched. `username` is already `@unique` on this
+ * table, so it is a proper natural key: the seed stays idempotent across
+ * re-runs while the primary key is a real random UUID.
+ *
+ * Hospital and clinic ids are deliberately NOT randomised — see the note beside
+ * their constants. HOSPITAL_A's id in particular is a production identifier
+ * written by migration 20260626130000 and used as a column default.
+ */
 async function seedStaff(): Promise<void> {
-  const receptionHash = await bcrypt.hash('reception123', 12);
-  const adminHash = await bcrypt.hash('admin123', 12);
-  const superHash = await bcrypt.hash('superadmin123', 12);
+  const receptionHash = await bcrypt.hash(devPassword('SEED_RECEPTION_PASSWORD', 'reception / reception2'), 12);
+  const adminHash = await bcrypt.hash(devPassword('SEED_ADMIN_PASSWORD', 'admin / admin2'), 12);
+  const superHash = await bcrypt.hash(devPassword('SEED_SUPERADMIN_PASSWORD', 'superadmin'), 12);
 
-  await prisma.staff.upsert({
-    where: { id: STAFF_RECEPTION },
-    update: { loginCredentials: receptionHash, username: 'reception', hospitalId: HOSPITAL_A, clinicId: CLINIC_A },
-    create: {
-      id: STAFF_RECEPTION,
-      hospitalId: HOSPITAL_A,
-      clinicId: CLINIC_A,
-      name: 'Front Desk',
-      role: StaffRole.RECEPTIONIST,
-      username: 'reception',
-      loginCredentials: receptionHash,
-    },
-  });
-  await prisma.staff.upsert({
-    where: { id: STAFF_RECEPTION_B },
-    update: { loginCredentials: receptionHash, username: 'reception2', hospitalId: HOSPITAL_B, clinicId: CLINIC_B },
-    create: {
-      id: STAFF_RECEPTION_B,
-      hospitalId: HOSPITAL_B,
-      clinicId: CLINIC_B,
-      name: 'Apollo Front Desk',
-      role: StaffRole.RECEPTIONIST,
-      username: 'reception2',
-      loginCredentials: receptionHash,
-    },
-  });
-  await prisma.staff.upsert({
-    where: { id: STAFF_ADMIN },
-    update: { loginCredentials: adminHash, username: 'admin', hospitalId: HOSPITAL_A, clinicId: CLINIC_A },
-    create: {
-      id: STAFF_ADMIN,
-      hospitalId: HOSPITAL_A,
-      clinicId: CLINIC_A,
-      name: 'Clinic Admin',
-      role: StaffRole.ADMIN,
-      username: 'admin',
-      loginCredentials: adminHash,
-    },
-  });
-  // ADMIN for HOSPITAL_B — so the demo has an admin per hospital and cross-tenant
-  // isolation is exercisable by logging into each.
-  await prisma.staff.upsert({
-    where: { id: STAFF_ADMIN_B },
-    update: { loginCredentials: adminHash, username: 'admin2', hospitalId: HOSPITAL_B, clinicId: CLINIC_B },
-    create: {
-      id: STAFF_ADMIN_B,
-      hospitalId: HOSPITAL_B,
-      clinicId: CLINIC_B,
-      name: 'Apollo Admin',
-      role: StaffRole.ADMIN,
-      username: 'admin2',
-      loginCredentials: adminHash,
-    },
-  });
-  // Super-admin: ADMIN account (HOSPITAL_A) used for the admin dashboard.
-  // Credentials documented in DEMO.md.
-  await prisma.staff.upsert({
-    where: { id: SUPER_ADMIN },
-    update: { loginCredentials: superHash, username: 'superadmin', hospitalId: HOSPITAL_A, clinicId: CLINIC_A },
-    create: {
-      id: SUPER_ADMIN,
-      hospitalId: HOSPITAL_A,
-      clinicId: CLINIC_A,
-      name: 'Super Admin',
-      role: StaffRole.ADMIN,
-      username: 'superadmin',
-      loginCredentials: superHash,
-    },
-  });
+  const staff: Array<{
+    username: string;
+    name: string;
+    role: StaffRole;
+    hospitalId: string;
+    clinicId: string;
+    hash: string;
+  }> = [
+    { username: 'reception',  name: 'Front Desk',        role: StaffRole.RECEPTIONIST, hospitalId: HOSPITAL_A, clinicId: CLINIC_A, hash: receptionHash },
+    { username: 'reception2', name: 'Apollo Front Desk', role: StaffRole.RECEPTIONIST, hospitalId: HOSPITAL_B, clinicId: CLINIC_B, hash: receptionHash },
+    { username: 'admin',      name: 'Clinic Admin',      role: StaffRole.ADMIN,        hospitalId: HOSPITAL_A, clinicId: CLINIC_A, hash: adminHash },
+    // ADMIN for HOSPITAL_B — so the demo has an admin per hospital and
+    // cross-tenant isolation is exercisable by logging into each.
+    { username: 'admin2',     name: 'Apollo Admin',      role: StaffRole.ADMIN,        hospitalId: HOSPITAL_B, clinicId: CLINIC_B, hash: adminHash },
+    // "Super admin" is a NAME, not a role: StaffRole has no SUPERADMIN tier.
+    // This is an ordinary ADMIN on HOSPITAL_A used by the admin dashboard.
+    { username: 'superadmin', name: 'Super Admin',       role: StaffRole.ADMIN,        hospitalId: HOSPITAL_A, clinicId: CLINIC_A, hash: superHash },
+  ];
+
+  for (const m of staff) {
+    await prisma.staff.upsert({
+      where: { username: m.username },
+      update: {
+        loginCredentials: m.hash,
+        name: m.name,
+        role: m.role,
+        hospitalId: m.hospitalId,
+        clinicId: m.clinicId,
+      },
+      create: {
+        id: randomUUID(),
+        username: m.username,
+        loginCredentials: m.hash,
+        name: m.name,
+        role: m.role,
+        hospitalId: m.hospitalId,
+        clinicId: m.clinicId,
+      },
+    });
+  }
 }
 
-// Recurring weekly schedule templates (DoctorSession).
-//
 // Same-day model: the patient app's "Join Queue" auto-resolves TODAY's session,
 // so every demo doctor gets at least one session that runs EVERY day of the week
 // (daysOfWeek 0..6). That way the demo's same-day queue works no matter which
 // day the seed is run/demoed on — no "no sessions today" dead end on a weekend.
 // maxTokens is retained but is now informational ("expected load"), NOT a cap.
 const EVERY_DAY = [0, 1, 2, 3, 4, 5, 6];
+
 async function seedSchedules(): Promise<void> {
   // ONE session per doctor per day — no morning/evening split. sessionType is a
   // pinned constant (see common/session/daily-session.ts), never a time of day.
+  // Doctor ids are resolved at runtime, so this list is built inside the function.
   const rows = [
     { id: 'demo-sess-smith-am', doctorId: DR_SMITH, sessionType: DAILY_SESSION_TYPE, startTime: '09:00', maxTokens: 20, daysOfWeek: EVERY_DAY },
     { id: 'demo-sess-meera-am', doctorId: DR_MEERA, sessionType: DAILY_SESSION_TYPE, startTime: '10:00', maxTokens: 18, daysOfWeek: EVERY_DAY },
@@ -215,8 +301,6 @@ async function seedSchedules(): Promise<void> {
   }
 }
 
-// Inbound telephony DIDs → clinic, so the voice agent routes a call to the right
-// tenant. One demo number per clinic.
 async function seedVoiceNumbers(): Promise<void> {
   const rows = [
     { id: 'demo-voice-a', didNumber: '+918040001234', clinicId: CLINIC_A, language: 'en' },
@@ -239,7 +323,8 @@ interface DoctorSeed {
   username: string;
 }
 
-const DOCTORS: DoctorSeed[] = [
+// Lazy: evaluated AFTER resolveDoctorIdentities() has assigned the doctor ids.
+const DOCTORS = (): DoctorSeed[] => [
   { id: DR_SMITH, clinicId: CLINIC_A, name: 'Dr. Anil Smith', specialization: 'General Medicine', fee: 500, avg: 10, username: 'drsmith' },
   { id: DR_MEERA, clinicId: CLINIC_A, name: 'Dr. Meera Nair', specialization: 'Pediatrics', fee: 400, avg: 12, username: 'meera.nair' },
   { id: DR_ARJUN, clinicId: CLINIC_A, name: 'Dr. Arjun Rao', specialization: 'ENT', fee: 350, avg: 8, username: 'arjun.rao' },
@@ -250,12 +335,44 @@ const DOCTORS: DoctorSeed[] = [
   { id: DR_SUNITA_A, clinicId: CLINIC_C, name: 'Dr. Sunita Sharma', specialization: 'Dermatology', fee: 550, avg: 10, username: 'sunita.sharma' },
 ];
 
+/**
+ * Adopt existing ids for the seeded doctors, or keep the freshly generated ones.
+ *
+ * The seed must stay idempotent — `docker compose up` re-runs it — but its keys
+ * are no longer predictable constants. `username` is `@unique` on `doctors`, so
+ * it serves as the natural key: if a doctor with that username already exists we
+ * reuse its primary key, and every downstream fixture (bookings, audit entries,
+ * consultation notes) then points at the same row as before.
+ *
+ * Runs BEFORE any fixture array is evaluated; those arrays are lazy functions
+ * for exactly this reason.
+ */
+async function resolveDoctorIdentities(): Promise<void> {
+  const byUsername: Record<string, (id: string) => void> = {
+    'drsmith': (id) => { DR_SMITH = id; },
+    'meera.nair': (id) => { DR_MEERA = id; },
+    'arjun.rao': (id) => { DR_ARJUN = id; },
+    'kavya.pillai': (id) => { DR_KAVYA = id; },
+    'sunita.verma': (id) => { DR_SUNITA = id; },
+    'sunita.sharma': (id) => { DR_SUNITA_A = id; },
+  };
+
+  const existing = await prisma.doctor.findMany({
+    where: { username: { in: Object.keys(byUsername) } },
+    select: { id: true, username: true },
+  });
+  for (const row of existing) {
+    if (row.username && byUsername[row.username]) byUsername[row.username](row.id);
+  }
+}
+
 async function seedDoctors(): Promise<void> {
-  // every doctor shares the demo password 'doctor123' (documented in DEMO.md)
-  const hash = await bcrypt.hash('doctor123', 12);
-  for (const d of DOCTORS) {
+  // All seeded doctors share one development password: generated per run, or
+  // pinned with SEED_DOCTOR_PASSWORD. See devPassword().
+  const hash = await bcrypt.hash(devPassword('SEED_DOCTOR_PASSWORD', 'all seeded doctors'), 12);
+  for (const d of DOCTORS()) {
     await prisma.doctor.upsert({
-      where: { id: d.id },
+      where: { username: d.username },
       update: {
         clinicId: d.clinicId,
         name: d.name,
@@ -349,7 +466,8 @@ interface BookingSeed {
 // a doctor's session. Completed visits are dated across the last few days (and
 // each carries a real wait + consult gap) so the daily trend chart has multiple
 // points and average-wait/consult come out positive and realistic.
-const BOOKINGS: BookingSeed[] = [
+// Lazy: evaluated AFTER resolveDoctorIdentities() has assigned the doctor ids.
+const BOOKINGS = (): BookingSeed[] => [
   // Dr Smith — two seen today, two waiting
   { id: 'demo-bk-01', patientId: 'demo-pt-01', doctorId: DR_SMITH, sessionType: DAILY_SESSION_TYPE, status: BookingStatus.COMPLETED, token: 'A001', fee: 500, payment: PaymentStatus.SUCCESS, paymentId: 'demo-pay-01', completed: true, dayOffset: 0, waitMinutes: 45, consultMinutes: 12 },
   { id: 'demo-bk-02', patientId: 'demo-pt-02', doctorId: DR_SMITH, sessionType: DAILY_SESSION_TYPE, status: BookingStatus.COMPLETED, token: 'A002', fee: 500, payment: PaymentStatus.SUCCESS, paymentId: 'demo-pay-02', completed: true, dayOffset: 0, waitMinutes: 30, consultMinutes: 10 },
@@ -415,7 +533,7 @@ async function seedBookings(): Promise<void> {
   // and the patient is gone from the DB while their token lingers in Redis
   // (Redis is untouched here), leaving phantom tokens in the reception/doctor
   // queues. Rows the seed owns are upserted by id below, so they need no delete.
-  const seedSlots = BOOKINGS.map((b) => {
+  const seedSlots = BOOKINGS().map((b) => {
     const t = b.completed ? completedTimes(b) : null;
     return {
       doctorId: b.doctorId,
@@ -427,7 +545,7 @@ async function seedBookings(): Promise<void> {
   await prisma.booking.deleteMany({
     where: {
       OR: seedSlots,
-      id: { notIn: BOOKINGS.map((b) => b.id) },
+      id: { notIn: BOOKINGS().map((b) => b.id) },
     },
   });
 
@@ -446,14 +564,14 @@ async function seedBookings(): Promise<void> {
   // database is left untouched, and archival's own no-update/no-delete invariant
   // (HA-3) is not weakened, because this is the seed's own data, not the sweep's.
   await prisma.bookingHistory.deleteMany({
-    where: { bookingId: { in: BOOKINGS.map((b) => b.id) } },
+    where: { bookingId: { in: BOOKINGS().map((b) => b.id) } },
   });
 
   // Live (not-completed) bookings sit in today's session; give them a createdAt
   // a little while ago so "today" is populated without inventing a consult.
   const liveCreatedAt = new Date(Date.now() - 25 * 60_000);
 
-  for (const b of BOOKINGS) {
+  for (const b of BOOKINGS()) {
     const t = b.completed ? completedTimes(b) : null;
     const sessionDate = t ? t.sessionDate : d;
     bookingSessionDate.set(b.id, sessionDate);
@@ -509,7 +627,8 @@ interface AuditSeed {
 
 // DONE entries for the completed consultations + one SKIP, so the audit log
 // shows real who-did-what activity.
-const AUDIT: AuditSeed[] = [
+// Lazy: evaluated AFTER resolveDoctorIdentities() has assigned the doctor ids.
+const AUDIT = (): AuditSeed[] => [
   { id: 'demo-audit-01', doctorId: DR_SMITH, clinicId: CLINIC_A, action: 'DONE', token: 'A001', bookingId: 'demo-bk-01', sessionType: DAILY_SESSION_TYPE },
   { id: 'demo-audit-02', doctorId: DR_SMITH, clinicId: CLINIC_A, action: 'DONE', token: 'A002', bookingId: 'demo-bk-02', sessionType: DAILY_SESSION_TYPE },
   { id: 'demo-audit-03', doctorId: DR_SMITH, clinicId: CLINIC_A, action: 'SKIP', token: 'A003', bookingId: 'demo-bk-03', sessionType: DAILY_SESSION_TYPE },
@@ -518,12 +637,20 @@ const AUDIT: AuditSeed[] = [
 ];
 
 async function seedAudit(): Promise<void> {
-  for (const a of AUDIT) {
+  // Resolve the desk operator by username: staff ids are generated now, so this
+  // fixture cannot reference a hardcoded one.
+  const deskOperator = await prisma.staff.findUnique({
+    where: { username: 'reception' },
+    select: { id: true },
+  });
+  if (!deskOperator) throw new Error('seedAudit: reception staff not found — seedStaff must run first');
+
+  for (const a of AUDIT()) {
     // Match the audit row's date to the booking's actual session day (completed
     // visits may be on past days), falling back to today for any unmapped id.
     const sessionDate = bookingSessionDate.get(a.bookingId) ?? today();
     const data = {
-      actorId: STAFF_RECEPTION, // recorded against the desk operator
+      actorId: deskOperator.id, // recorded against the desk operator
       actorRole: 'STAFF',
       clinicId: a.clinicId,
       action: a.action,
@@ -554,7 +681,8 @@ interface NoteSeed {
 // Consultation notes for the completed bookings, so the doctor↔patient loop has
 // real records to show. Realistic Indian OP context. Keyed by bookingId (unique)
 // so re-running upserts the same row — idempotent.
-const NOTES: NoteSeed[] = [
+// Lazy: evaluated AFTER resolveDoctorIdentities() has assigned the doctor ids.
+const NOTES = (): NoteSeed[] => [
   {
     bookingId: 'demo-bk-01', // Dr Smith (General Medicine) · Asha Rao
     doctorId: DR_SMITH,
@@ -588,7 +716,7 @@ const NOTES: NoteSeed[] = [
 ];
 
 async function seedNotes(): Promise<void> {
-  for (const n of NOTES) {
+  for (const n of NOTES()) {
     const followUpDate =
       n.followUpInDays === null
         ? null
@@ -661,7 +789,7 @@ async function seedOpConfig(): Promise<void> {
   }
 
   // A weekday-morning session template per doctor (Mon–Sat).
-  for (const d of DOCTORS) {
+  for (const d of DOCTORS()) {
     for (let day = 1; day <= 6; day++) {
       const id = `demo-tmpl-${d.id.slice(-4)}-${day}`;
       await prisma.sessionTemplate.upsert({
@@ -674,6 +802,14 @@ async function seedOpConfig(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  // First statement in the script — before any read, write or delete.
+  assertSafeToSeed();
+
+  // Must run before any fixture array is evaluated: it decides whether this run
+  // adopts the ids of doctors already in the database or uses freshly generated
+  // ones. Every fixture array is a lazy function so it observes the result.
+  await resolveDoctorIdentities();
+
   await cleanupLegacy();
   await seedHospitals();
   await seedClinics();
@@ -689,14 +825,18 @@ async function main(): Promise<void> {
 
   console.log('Demo seed complete:');
   console.log('  Hospitals: City Health Network (City Care + Metro Care), Apollo Group (Apollo Hospitals)');
-  console.log(`  Doctors : ${DOCTORS.length} (all password: doctor123)`);
+  console.log(`  Doctors : ${DOCTORS().length}`);
   console.log(`  Patients: ${PATIENTS.length}`);
   console.log('  OP config: TokenSeries (Normal+Special), QueuePolicy, SessionTemplate per demo clinic');
-  console.log(`  Bookings: ${BOOKINGS.length} (completed / confirmed / expired)`);
-  console.log(`  Notes   : ${NOTES.length} consultation notes on completed visits`);
-  console.log('  Logins  : City Health Network -> admin/admin123, superadmin/superadmin123, reception/reception123');
-  console.log('            Apollo Group         -> admin2/admin123, reception2/reception123');
-  console.log('            doctors -> drsmith/doctor123 (and others, all doctor123)');
+  console.log(`  Bookings: ${BOOKINGS().length} (completed / confirmed / expired)`);
+  console.log(`  Notes   : ${NOTES().length} consultation notes on completed visits`);
+  // Usernames only here. Any password generated for this run is printed by
+  // reportGeneratedCredentials() below, which is explicitly a message to the
+  // developer at their terminal — not something the application ever logs.
+  console.log('  Logins  : City Health Network -> admin, superadmin, reception');
+  console.log('            Apollo Group         -> admin2, reception2');
+  console.log('            Doctors              -> drsmith (and others)');
+  reportGeneratedCredentials();
 }
 
 main()

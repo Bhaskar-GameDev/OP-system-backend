@@ -135,21 +135,52 @@ clinic ids return 404 rather than a blank board.
 
 ## Demo logins
 
-Seeded by `npm run db:seed`.
+Seeded by `npm run db:seed`, which runs in **development and test only** — it
+refuses to run when `NODE_ENV=production`.
 
-| Tenant               | Role       | Username     | Password        |
-| -------------------- | ---------- | ------------ | --------------- |
-| City Health Network  | admin      | `admin`      | `admin123`      |
-| City Health Network  | super admin| `superadmin` | `superadmin123` |
-| City Health Network  | reception  | `reception`  | `reception123`  |
-| Apollo Group         | admin      | `admin2`     | `admin123`      |
-| Apollo Group         | reception  | `reception2` | `reception123`  |
-| —                    | doctor     | `drsmith`    | `doctor123`     |
+**This file no longer publishes passwords.** It previously listed a working
+password for every privileged account, including a hospital-wide `superadmin`,
+in a public repository. The seed now generates a fresh random password per
+account on every run and prints them **once, to your terminal**, at the end of
+the seed output:
 
-All other seeded doctors also use `doctor123`.
+```
+  ── DEVELOPMENT CREDENTIALS (generated this run) ──────────────
+    reception / reception2       <printed here>   (pin with SEED_RECEPTION_PASSWORD)
+    admin / admin2               <printed here>   (pin with SEED_ADMIN_PASSWORD)
+    superadmin                   <printed here>   (pin with SEED_SUPERADMIN_PASSWORD)
+    all seeded doctors           <printed here>   (pin with SEED_DOCTOR_PASSWORD)
+```
 
-Patient login is OTP. With no SMS credentials configured the OTP is written to
-the backend log; in the demo build it is `000000`.
+Usernames (not secret):
+
+| Tenant              | Role        | Username     | Password                        |
+| ------------------- | ----------- | ------------ | ------------------------------- |
+| City Health Network | admin       | `admin`      | `<LOCAL_DEVELOPMENT_PASSWORD>`  |
+| City Health Network | super admin | `superadmin` | `<LOCAL_DEVELOPMENT_PASSWORD>`  |
+| City Health Network | reception   | `reception`  | `<LOCAL_DEVELOPMENT_PASSWORD>`  |
+| Apollo Group        | admin       | `admin2`     | `<LOCAL_DEVELOPMENT_PASSWORD>`  |
+| Apollo Group        | reception   | `reception2` | `<LOCAL_DEVELOPMENT_PASSWORD>`  |
+| —                   | doctor      | `drsmith`    | `<LOCAL_DEVELOPMENT_PASSWORD>`  |
+
+"super admin" is a name, not a role — `StaffRole` has no such tier; the account
+is an ordinary `ADMIN`.
+
+### Want a stable password across re-seeds?
+
+Set it yourself before seeding. Never commit the value.
+
+```bash
+SEED_ADMIN_PASSWORD='<choose-your-own>' \
+SEED_SUPERADMIN_PASSWORD='<choose-your-own>' \
+SEED_RECEPTION_PASSWORD='<choose-your-own>' \
+SEED_DOCTOR_PASSWORD='<choose-your-own>' \
+npm run db:seed
+```
+
+Patient login is OTP. With no SMS credentials configured the backend issues a
+fixed development OTP — see `DEV_OTP_CODE` in `src/auth/otp.service.ts`. That
+path is blocked under `NODE_ENV=production`, and the OTP value is never logged.
 
 ---
 

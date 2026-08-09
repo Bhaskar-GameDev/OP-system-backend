@@ -5,6 +5,7 @@ import { AuthTokenService, Role } from './auth-token.service';
 import { OtpService } from './otp.service';
 import { PasswordService } from './password.service';
 import { RefreshTokenService } from './refresh-token.service';
+import { LoginThrottleService } from './login-throttle.service';
 
 export interface AuthResult {
   token: string;
@@ -30,6 +31,7 @@ export class AuthService {
     private readonly otp: OtpService,
     private readonly passwords: PasswordService,
     private readonly refresh: RefreshTokenService,
+    private readonly throttle: LoginThrottleService,
   ) {}
 
   // ── patient OTP ──────────────────────────────────────────
@@ -80,15 +82,23 @@ export class AuthService {
   }
 
   // ── staff login (username/password) ──────────────────────
-  async staffLogin(username: string, password: string): Promise<AuthResult> {
+  async staffLogin(username: string, password: string, ip = ''): Promise<AuthResult> {
+    // Checked before the lookup and before bcrypt, so a throttled attempt costs
+    // a Redis read instead of a cost-12 hash.
+    await this.throttle.assertNotThrottled('staff', username, ip);
+
     const staff = await this.prisma.staff.findUnique({
       where: { username },
       include: { hospital: { select: { name: true } } },
     });
     // compare even when not found is unnecessary here; reject uniformly
     if (!staff || !(await this.passwords.compare(password, staff.loginCredentials))) {
+      // Counted for unknown usernames too, so a failure is indistinguishable
+      // from one against a real account.
+      await this.throttle.recordFailure('staff', username, ip);
       throw new UnauthorizedException('invalid credentials');
     }
+    await this.throttle.recordSuccess('staff', username);
     // staff role maps to a coarse RBAC role
     const role: Role = staff.role === StaffRole.ADMIN ? 'ADMIN' : 'STAFF';
     const token = this.tokens.sign({
@@ -107,7 +117,9 @@ export class AuthService {
   }
 
   // ── doctor login (username/password) ─────────────────────
-  async doctorLogin(username: string, password: string): Promise<AuthResult> {
+  async doctorLogin(username: string, password: string, ip = ''): Promise<AuthResult> {
+    await this.throttle.assertNotThrottled('doctor', username, ip);
+
     const doctor = await this.prisma.doctor.findUnique({
       where: { username },
       include: { clinic: { select: { hospitalId: true, hospital: { select: { name: true } } } } },
@@ -117,8 +129,10 @@ export class AuthService {
       !doctor.passwordHash ||
       !(await this.passwords.compare(password, doctor.passwordHash))
     ) {
+      await this.throttle.recordFailure('doctor', username, ip);
       throw new UnauthorizedException('invalid credentials');
     }
+    await this.throttle.recordSuccess('doctor', username);
     const hospitalId = doctor.clinic.hospitalId;
     const token = this.tokens.sign({
       sub: doctor.id,
