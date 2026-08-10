@@ -10,6 +10,7 @@ import { ConfigService } from '@nestjs/config';
 import { RedisService } from '../common/redis/redis.service';
 import { assertNotProduction } from '../common/config/production-config.validator';
 import { SMS_SENDER, SmsSender } from './sms.sender';
+import { MetricsService } from '../common/observability/metrics.service';
 
 /**
  * The fixed code used ONLY in development and test, where no SMS provider is
@@ -57,6 +58,7 @@ export class OtpService {
     private readonly redisService: RedisService,
     private readonly config: ConfigService,
     @Inject(SMS_SENDER) private readonly sms: SmsSender,
+    private readonly metrics: MetricsService,
   ) {}
 
   private ttl(): number {
@@ -143,13 +145,19 @@ export class OtpService {
     switch (res[0]) {
       case 'OK':
         return;
+      // Patient-side auth failures are counted with the same metric as staff
+      // ones, split by reason: a spike in 'locked' is an account under attack,
+      // a spike in 'no_otp' is usually SMS delivery failing.
       case 'NO_OTP':
+        this.metrics.authFailures.inc({ scope: 'patient', reason: 'no_otp' });
         throw new UnauthorizedException('no active OTP; request a new one');
       case 'LOCKED':
+        this.metrics.authFailures.inc({ scope: 'patient', reason: 'locked' });
         throw new UnauthorizedException(
           'too many wrong attempts; OTP invalidated, request a new one',
         );
       default:
+        this.metrics.authFailures.inc({ scope: 'patient', reason: 'incorrect_otp' });
         throw new UnauthorizedException('incorrect OTP');
     }
   }

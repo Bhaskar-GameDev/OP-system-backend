@@ -1,0 +1,151 @@
+# Alert rules for Patient Flow OS.
+#
+# These are the alerts the production-readiness audit named as required before
+# launch (§21). They are committed here so the thresholds are reviewable and
+# versioned with the code that emits the metrics — but a rule file alone pages
+# nobody. Loading them into Prometheus and wiring Alertmanager to a real
+# destination is an ops action that must be done and TESTED (a deliberate
+# failure must reach a human) before this system takes patient traffic.
+#
+# Thresholds marked PROVISIONAL have never been calibrated against production
+# traffic, because none exists yet. Review them after the first week of real
+# load rather than treating them as tuned.
+
+groups:
+  - name: pfos-availability
+    rules:
+      - alert: BackendDown
+        expr: up{job="pfos-backend"} == 0
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: "Backend is not being scraped"
+          description: >-
+            Prometheus cannot reach the backend. Either the process is down or
+            the network path to it is. Check `docker compose ps` and the
+            container logs first.
+
+      - alert: BackendNotReady
+        expr: pfos_http_request_duration_seconds_count{route="/health/ready",status!="200"} > 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "Readiness probe failing — a dependency is down"
+          description: >-
+            /health/ready is returning non-200, which means Postgres or Redis is
+            unreachable. The response body names which. A Redis outage stops
+            token issue and erases live queue ordering; follow the Redis section
+            of the runbook.
+
+  - name: pfos-errors
+    rules:
+      - alert: HighServerErrorRate
+        # PROVISIONAL: 5% of requests over 5 minutes.
+        expr: >-
+          sum(rate(pfos_http_request_duration_seconds_count{status=~"5.."}[5m]))
+            /
+          sum(rate(pfos_http_request_duration_seconds_count[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Over 5% of requests are failing"
+          description: >-
+            Break down by route with
+            sum by (route) (rate(pfos_http_request_duration_seconds_count{status=~"5.."}[5m])).
+            Every 5xx carries a requestId in its body and in the logs.
+
+      - alert: SlowRequests
+        # PROVISIONAL: p95 above 2s. Calibrate after the first load test — the
+        # audit lists benchmarking as still outstanding.
+        expr: >-
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(pfos_http_request_duration_seconds_bucket[5m]))
+          ) > 2
+        for: 10m
+        labels:
+          severity: warn
+        annotations:
+          summary: "p95 request latency above 2s"
+
+  - name: pfos-security
+    rules:
+      - alert: AuthFailureSpike
+        # PROVISIONAL: sustained 1/s of failed logins is far above what a clinic
+        # produces by fat-fingering a password.
+        expr: sum(rate(pfos_auth_failures_total[5m])) > 1
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Sustained authentication failures"
+          description: >-
+            Split by scope: staff/doctor failures are a credential attack on
+            hospital-wide access; patient failures are more often SMS delivery
+            breaking. Check pfos_login_throttled_total alongside this.
+
+      - alert: LoginThrottleEngaged
+        expr: sum(rate(pfos_login_throttled_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warn
+        annotations:
+          summary: "Brute-force throttle is firing"
+          description: >-
+            The throttle is working, but something is hitting it hard enough to
+            be worth looking at. Identify the account from the backend logs
+            (the throttle logs scope and retry-after, never the credential).
+
+  - name: pfos-domain
+    rules:
+      - alert: ProjectionLagging
+        # A stalled projection is silent: endpoints keep answering 200 while
+        # every dashboard shows the past. PROVISIONAL threshold.
+        expr: pfos_projection_lag_events > 500
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Read models are falling behind the event store"
+          description: >-
+            The projection tick runs every 2s. Sustained lag means it is failing
+            or starved — check pfos_projection_failures_total and the backend
+            logs for "op projection tick failed".
+
+      - alert: ProjectionFailing
+        expr: increase(pfos_projection_failures_total[10m]) > 3
+        for: 0m
+        labels:
+          severity: page
+        annotations:
+          summary: "Projection passes are throwing"
+
+      - alert: RealtimeClientsGone
+        # Staff dashboards hold a socket all day. Zero during clinic hours means
+        # the realtime layer is broken, not that everyone went home.
+        expr: sum(pfos_socket_connections) == 0
+        for: 15m
+        labels:
+          severity: warn
+        annotations:
+          summary: "No realtime clients connected"
+          description: >-
+            Expected outside clinic hours; investigate if it fires during the
+            working day. Silence this rule if the deployment has predictable
+            closed periods rather than letting it cry wolf.
+
+      - alert: IntegrationFailures
+        expr: >-
+          sum by (provider) (rate(pfos_integration_calls_total{outcome="failure"}[10m])) > 0.1
+        for: 10m
+        labels:
+          severity: warn
+        annotations:
+          summary: "{{ $labels.provider }} calls are failing"
+          description: >-
+            MSG91 failing means patients cannot log in. FCM failing means nobody
+            is told their turn is approaching — and push failures are swallowed
+            by design, so this metric is the only signal.

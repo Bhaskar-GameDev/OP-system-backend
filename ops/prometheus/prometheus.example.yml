@@ -1,0 +1,38 @@
+# Example Prometheus scrape configuration for Patient Flow OS.
+#
+# Committed as an EXAMPLE, not as deployed configuration: this repository does
+# not provision monitoring. Copy it onto the monitoring host, point it at the
+# real backend address, and load ./alerts.yml alongside it.
+#
+# The backend only publishes /metrics when METRICS_TOKEN is set (in production it
+# 404s otherwise), so the token below has to match the backend's environment.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            # Alertmanager, and through it a destination a HUMAN reads. A rule
+            # that fires into a void is not monitoring. Verify by causing a
+            # deliberate failure and confirming someone is actually paged.
+            - "alertmanager:9093"
+
+scrape_configs:
+  - job_name: "pfos-backend"
+    metrics_path: /metrics
+    # Scrape over the internal network. The backend publishes no host port in
+    # docker-compose.prod.yml — only Caddy does — so the monitoring host must
+    # either sit on the same compose network or scrape through Caddy over TLS.
+    static_configs:
+      - targets: ["backend:3000"]
+    authorization:
+      type: Bearer
+      # Keep this out of version control on the real host: use a file reference
+      # (`credentials_file`) rather than an inline value.
+      credentials: "REPLACE_WITH_METRICS_TOKEN"

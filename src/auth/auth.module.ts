@@ -2,6 +2,7 @@ import { Global, Module } from '@nestjs/common';
 import { AuthTokenService } from './auth-token.service';
 import { AuthService } from './auth.service';
 import { RefreshTokenService } from './refresh-token.service';
+import { SessionRevocationService } from './session-revocation.service';
 import { LoginThrottleService } from './login-throttle.service';
 import { OtpService } from './otp.service';
 import { PasswordService } from './password.service';
@@ -19,6 +20,7 @@ import { AuthController } from './auth.controller';
     AuthTokenService,
     AuthService,
     RefreshTokenService,
+    SessionRevocationService,
     LoginThrottleService,
     OtpService,
     PasswordService,
@@ -26,6 +28,12 @@ import { AuthController } from './auth.controller';
     RolesGuard,
     { provide: SMS_SENDER, useClass: Msg91SmsSender },
   ],
-  exports: [AuthTokenService, AuthService, JwtAuthGuard, RolesGuard],
+  exports: [
+    AuthTokenService,
+    AuthService,
+    SessionRevocationService,
+    JwtAuthGuard,
+    RolesGuard,
+  ],
 })
 export class AuthModule {}

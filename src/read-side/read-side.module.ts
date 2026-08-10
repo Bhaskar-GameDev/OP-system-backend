@@ -7,6 +7,7 @@ import { NotificationDispatcher } from './notification-dispatcher.service';
 import { ProjectionService } from './projection.service';
 import { ProjectionRunner } from './projection-runner.service';
 import { QueueReadService } from './queue-read.service';
+import { ObservabilityModule } from '../common/observability/observability.module';
 
 /**
  * CQRS read side (Phases 10+14): projector + read models + notification pipeline.
@@ -14,6 +15,10 @@ import { QueueReadService } from './queue-read.service';
  * can replace the default LogNotificationProvider with no dispatcher change.
  */
 @Module({
+  // ObservabilityModule is @Global under AppModule, but imported explicitly so
+  // the partial test modules that assemble the read side on its own still
+  // resolve MetricsService (the projection publishes its lag from here).
+  imports: [ObservabilityModule],
   providers: [
     {
       provide: NOTIFICATION_PROVIDERS,

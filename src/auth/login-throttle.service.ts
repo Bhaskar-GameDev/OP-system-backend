@@ -1,6 +1,7 @@
 import { HttpException, HttpStatus, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { RedisService } from '../common/redis/redis.service';
+import { MetricsService } from '../common/observability/metrics.service';
 
 /**
  * Brute-force protection for privileged (username/password) logins.
@@ -37,6 +38,7 @@ export class LoginThrottleService {
   constructor(
     private readonly redisService: RedisService,
     private readonly config: ConfigService,
+    private readonly metrics: MetricsService,
   ) {}
 
   /** Failed attempts for one username before its cooldown starts. */
@@ -89,6 +91,9 @@ export class LoginThrottleService {
     this.logger.warn(
       `login throttled (${overIdentifier ? 'identifier' : 'ip'}) scope=${scope} retryAfter=${retryAfter}s`,
     );
+    // A rising throttle rate is a brute-force attempt in progress — the one
+    // auth signal that should page someone rather than sit in a log file.
+    this.metrics.loginThrottled.inc({ scope });
 
     throw new HttpException(
       {

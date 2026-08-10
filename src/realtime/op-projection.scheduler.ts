@@ -2,6 +2,7 @@ import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { Interval } from '@nestjs/schedule';
 import { ProjectionRunner } from '../read-side/projection-runner.service';
 import { QueueGateway } from '../queue-engine/queue.gateway';
+import { MetricsService } from '../common/observability/metrics.service';
 
 const TICK_MS = 2000;
 
@@ -27,6 +28,7 @@ export class OpProjectionScheduler implements OnModuleDestroy {
   constructor(
     private readonly runner: ProjectionRunner,
     private readonly gateway: QueueGateway,
+    private readonly metrics: MetricsService,
   ) {}
 
   /**
@@ -80,6 +82,7 @@ export class OpProjectionScheduler implements OnModuleDestroy {
         const applied = await this.runner.runOnce();
         if (applied > 0) await this.gateway.refreshActiveOpRooms();
       } catch (err) {
+        this.metrics.projectionFailures.inc();
         this.logger.warn(`op projection tick failed: ${String(err)}`);
       }
     })();

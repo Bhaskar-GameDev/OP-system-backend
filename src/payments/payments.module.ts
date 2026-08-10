@@ -14,6 +14,7 @@ import {
   RAZORPAY_GATEWAY,
 } from './razorpay.gateway';
 import { isProduction } from '../common/config/production-config.validator';
+import { MetricsService } from '../common/observability/metrics.service';
 
 /**
  * Gateway selection. Exported so the rule is directly testable rather than
@@ -27,12 +28,15 @@ import { isProduction } from '../common/config/production-config.validator';
  * DEVELOPMENT/TEST: the fake when no key id is set, so local booking works
  * end-to-end without live Razorpay credentials.
  */
-export function selectRazorpayGateway(config: ConfigService): RazorpayGateway {
+export function selectRazorpayGateway(
+  config: ConfigService,
+  metrics?: MetricsService,
+): RazorpayGateway {
   if (isProduction()) {
-    return new HttpRazorpayGateway(config);
+    return new HttpRazorpayGateway(config, metrics);
   }
   if ((config.get<string>('RAZORPAY_KEY_ID') ?? '').trim()) {
-    return new HttpRazorpayGateway(config);
+    return new HttpRazorpayGateway(config, metrics);
   }
   new Logger('PaymentsModule').warn(
     'RAZORPAY_KEY_ID unset — using FakeRazorpayGateway (development only; signatures are NOT verified)',
@@ -52,8 +56,9 @@ export function selectRazorpayGateway(config: ConfigService): RazorpayGateway {
       // Real gateway when keys are configured; dev fake otherwise so local
       // booking works end-to-end without live Razorpay credentials.
       provide: RAZORPAY_GATEWAY,
-      inject: [ConfigService],
-      useFactory: (config: ConfigService) => selectRazorpayGateway(config),
+      inject: [ConfigService, MetricsService],
+      useFactory: (config: ConfigService, metrics: MetricsService) =>
+        selectRazorpayGateway(config, metrics),
     },
   ],
   exports: [PaymentsService, RAZORPAY_GATEWAY],

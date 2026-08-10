@@ -27,3 +27,8 @@ prisma/*.db
 .DS_Store
 .idea
 *.swp
+
+# Monitoring scrape credential, created from .env.production (see ops/monitoring/README.md)
+ops/monitoring/metrics_token
+# Local alertmanager config carries the real receiver (webhook URL / SMTP creds)
+ops/monitoring/alertmanager.yml

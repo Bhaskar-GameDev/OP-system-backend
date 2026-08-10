@@ -4,6 +4,7 @@ import { DEV_OTP_CODE, OtpService } from '../src/auth/otp.service';
 import { maskMobile, Msg91SmsSender } from '../src/auth/sms.sender';
 import { RedisService } from '../src/common/redis/redis.service';
 import { ProductionConfigError } from '../src/common/config/production-config.validator';
+import { MetricsService } from '../src/common/observability/metrics.service';
 
 /**
  * P0-4 — the static OTP fallback must be unreachable in production, and no OTP
@@ -54,8 +55,11 @@ function makeService(authKey?: string, sms?: { sendOtp: jest.Mock }) {
       key === 'MSG91_AUTH_KEY' ? authKey : fallback,
   } as unknown as ConfigService;
   const sender = sms ?? { sendOtp: jest.fn(async () => undefined) };
+  // Real registry: OtpService counts failed verifications, and a stub would let
+  // a broken metric label pass unnoticed here.
+  const metrics = new MetricsService();
   return {
-    otp: new OtpService(service, config, sender as never),
+    otp: new OtpService(service, config, sender as never, metrics),
     store,
     sender,
   };
@@ -125,9 +129,12 @@ describe('SMS sender logging', () => {
   });
 
   const sender = (authKey?: string) =>
-    new Msg91SmsSender({
-      get: (key: string) => (key === 'MSG91_AUTH_KEY' ? authKey : undefined),
-    } as unknown as ConfigService);
+    new Msg91SmsSender(
+      {
+        get: (key: string) => (key === 'MSG91_AUTH_KEY' ? authKey : undefined),
+      } as unknown as ConfigService,
+      new MetricsService(),
+    );
 
   it('does not log the OTP value in the development fallback', async () => {
     process.env.NODE_ENV = 'development';

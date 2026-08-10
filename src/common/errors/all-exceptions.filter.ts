@@ -7,6 +7,7 @@ import {
   Logger,
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
+import { currentRequestId } from '../observability/request-context';
 
 // Structural shapes rather than `import type { Request, Response } from 'express'`
 // — @types/express is not a dependency here, and these are the only members the
@@ -51,7 +52,11 @@ export class AllExceptionsFilter implements ExceptionFilter {
     const { status, body, logAs } = this.resolve(exception);
 
     // 5xx is our bug and gets a stack; 4xx is the caller's and stays quiet at
-    // warn — a 404 storm must not drown the log that matters.
+    // warn — a 404 storm must not drown the log that matters. The request id is
+    // on every log line already (JsonLogger reads it from the request context);
+    // it goes in the RESPONSE body too, so a user reporting an error can quote
+    // the one string that finds the matching server log.
+    const requestId = currentRequestId();
     const where = `${req.method} ${req.url}`;
     if (logAs === 'error') {
       this.logger.error(
@@ -72,6 +77,7 @@ export class AllExceptionsFilter implements ExceptionFilter {
       statusCode: status,
       path: req.url,
       timestamp: new Date().toISOString(),
+      ...(requestId ? { requestId } : {}),
       ...body,
     });
   }

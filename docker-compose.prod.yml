@@ -22,6 +22,27 @@ services:
       POSTGRES_DB: patient_flow_os
     volumes:
       - pfos_pgdata:/var/lib/postgresql/data
+      # Write-ahead log archive. Kept on its OWN volume so a base backup and its
+      # WAL segments are not lost together, and so archiving cannot fill the
+      # data directory. basebackup.sh prunes it.
+      - pfos_wal_archive:/wal_archive
+    # Continuous WAL archiving turns a nightly dump (RPO up to 24 hours) into
+    # point-in-time recovery (RPO ~ the last archived segment). The archive
+    # command is deliberately conservative: it refuses to overwrite an existing
+    # segment, because silently replacing one breaks the replay chain in a way
+    # that is only discovered during a restore.
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_command=test ! -f /wal_archive/%f && cp %p /wal_archive/%f
+      - -c
+      - archive_timeout=300
+      - -c
+      - max_wal_senders=3
     networks:
       - internal
     # No `ports:` — Postgres is unreachable from the host/internet.
@@ -73,6 +94,8 @@ services:
       # Public origin(s). The desktop apps use tauri.localhost; the patient
       # native app sends no Origin. Add hosted web origins here if any.
       CORS_ORIGINS: "https://${DOMAIN},http://tauri.localhost,https://tauri.localhost"
+      # Unset means /metrics is disabled in production, not public. See ops/prometheus/.
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
       # Demo seeding is OFF and must stay off. The seed creates staff accounts
       # with documented passwords and deletes live bookings; the backend refuses
       # to start if this is ever set to true under NODE_ENV=production.
@@ -103,12 +126,15 @@ services:
     expose:
       - "3000"
     healthcheck:
-      # Any HTTP response (even 401/404) means Nest is up and serving.
+      # Readiness, not liveness: /health/ready answers 200 only when Postgres and
+      # Redis both respond. The previous check treated ANY HTTP response —
+      # including 401 and 404 — as healthy, so a backend whose database
+      # connection had died reported healthy while serving 503s to the clinic.
       test:
         - "CMD"
         - "node"
         - "-e"
-        - "require('http').get('http://127.0.0.1:3000',r=>process.exit(0)).on('error',()=>process.exit(1))"
+        - "require('http').get('http://127.0.0.1:3000/health/ready',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
       interval: 15s
       timeout: 5s
       retries: 5
@@ -138,6 +164,7 @@ networks:
 
 volumes:
   pfos_pgdata:
+  pfos_wal_archive:
   pfos_redisdata:
   pfos_caddy_data:
   pfos_caddy_config:

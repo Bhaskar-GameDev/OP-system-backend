@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
@@ -27,6 +27,9 @@ export interface SessionClaims {
   clinicId?: string;
   hospitalId?: string;
   exp?: number; // unix seconds
+  iat?: number; // unix seconds — issued at (diagnostics; revocation uses `gen`)
+  jti?: string; // unique session id — the handle logout revokes
+  gen?: number; // principal's session generation at mint time — see SessionRevocationService
 }
 
 /**
@@ -71,10 +74,20 @@ export class AuthTokenService {
     this.secret = configured || 'dev_secret';
   }
 
+  /**
+   * Every token gets a `jti` and an `iat`. They are what makes the token
+   * revocable: `jti` identifies the single session logout kills, `iat` places
+   * the token relative to the per-principal revocation epoch (see
+   * SessionRevocationService). Explicitly supplied values win, so a re-mint can
+   * preserve a session identity if it ever needs to.
+   */
   sign(claims: SessionClaims, ttlSeconds = 3600): string {
+    const now = Math.floor(Date.now() / 1000);
     const payload: SessionClaims = {
       ...claims,
-      exp: claims.exp ?? Math.floor(Date.now() / 1000) + ttlSeconds,
+      iat: claims.iat ?? now,
+      jti: claims.jti ?? randomUUID(),
+      exp: claims.exp ?? now + ttlSeconds,
     };
     const body = b64url(JSON.stringify(payload));
     return `${body}.${this.mac(body)}`;

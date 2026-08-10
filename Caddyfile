@@ -3,5 +3,22 @@
 # The only knob is the DOMAIN env var (set in .env.production).
 {$DOMAIN} {
 	encode gzip
+
+	# Edge security headers. The app sets its own CSP per route (JSON API vs the
+	# waiting-room board), so CSP is deliberately NOT set here — it would
+	# override the page-specific policy. These are the transport-level ones the
+	# app cannot set for responses it never sees, plus a second home for HSTS so
+	# it survives a backend that is briefly unavailable.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		# Nothing here needs a camera, a microphone or a location.
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()"
+		# Server fingerprint: no reason to advertise the proxy version.
+		-Server
+	}
+
 	reverse_proxy backend:3000
 }

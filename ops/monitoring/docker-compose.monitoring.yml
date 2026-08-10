@@ -1,0 +1,75 @@
+# Patient Flow OS — monitoring stack (Prometheus + Alertmanager).
+#
+# Sprint B committed alert RULES. Rules page nobody on their own; this file is
+# what runs them. Start it on the production host:
+#
+#   cd backend/ops/monitoring
+#   cp alertmanager.example.yml alertmanager.yml   # then edit the receiver
+#   METRICS_TOKEN=<from ../../.env.production> \
+#     docker compose -f docker-compose.monitoring.yml -p pfos-monitoring up -d
+#
+# It joins the backend's compose network so it can scrape `backend:3000`
+# directly — the backend publishes no host port, and routing metrics through
+# Caddy would expose them to the internet.
+#
+# NOTHING HERE IS PROOF. The requirement is that a real failure reaches a human.
+# After starting this, follow the verification procedure in ./README.md — stop
+# the backend, watch BackendDown fire, and confirm the alert ARRIVES. Until that
+# has been done once, treat alerting as not working.
+services:
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: pfos_prometheus
+    restart: always
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # The scrape credential lives in a gitignored file rather than in the
+      # committed config, so the config can be reviewed without carrying a
+      # secret and the token can be rotated without editing YAML.
+      - ./metrics_token:/etc/prometheus/metrics_token:ro
+      - ../prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - pfos_prometheus_data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # 90 days of history: enough to answer "was this slow before the release"
+      # and to calibrate the PROVISIONAL alert thresholds against real traffic.
+      - --storage.tsdb.retention.time=90d
+      - --web.enable-lifecycle
+    networks:
+      - pfos_internal
+      - monitoring
+    # Deliberately no published port. Reach the UI over an SSH tunnel:
+    #   ssh -L 9090:localhost:9090 <host>   (after adding a temporary port map)
+    # Publishing it would put an unauthenticated query interface over all of
+    # this system's operational data on the internet.
+    expose:
+      - "9090"
+
+  alertmanager:
+    image: prom/alertmanager:v0.28.0
+    container_name: pfos_alertmanager
+    restart: always
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - pfos_alertmanager_data:/alertmanager
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    networks:
+      - monitoring
+    expose:
+      - "9093"
+
+networks:
+  # The backend stack's network, joined from outside. `backend` compose creates
+  # it as <project>_internal; with the default project name that is
+  # backend_internal. Adjust if you deploy under a different project name.
+  pfos_internal:
+    external: true
+    name: backend_internal
+  monitoring:
+
+volumes:
+  pfos_prometheus_data:
+  pfos_alertmanager_data:

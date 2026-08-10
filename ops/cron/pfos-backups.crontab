@@ -1,0 +1,40 @@
+# Patient Flow OS — backup, base backup and restore drill schedule.
+#
+# Install on the production host:
+#
+#   sudo cp ops/cron/pfos-backups.crontab /etc/cron.d/pfos-backups
+#   sudo chown root:root /etc/cron.d/pfos-backups
+#   sudo chmod 644 /etc/cron.d/pfos-backups
+#   sudo systemctl restart cron
+#
+# Then VERIFY it is installed and firing — the audit's open question #1 was
+# whether any cron actually exists on the host, and a committed file answers
+# nothing on its own:
+#
+#   sudo run-parts --test /etc/cron.d            # syntax accepted
+#   grep CRON /var/log/syslog | grep pfos        # it ran, the morning after
+#   ls -l /opt/patient-flow-os/backend/backups   # artefacts exist and grow
+#
+# Paths assume the deploy layout /opt/patient-flow-os/backend. Adjust both the
+# APP_DIR line and the entries if you deploy elsewhere.
+
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+APP_DIR=/opt/patient-flow-os/backend
+
+# Encryption and offsite configuration. These MUST be set or backup.sh refuses
+# to run (by design — it will not write patient data in the clear). Prefer
+# sourcing them from a root-only file rather than inlining secrets here:
+#   BASH_ENV=/etc/pfos-backup.env
+BASH_ENV=/etc/pfos-backup.env
+
+# Nightly logical dump — the primary restore path.
+30 2 * * *   root  cd $APP_DIR && ./backup.sh >> backups/backup.log 2>&1
+
+# Weekly physical base backup + WAL shipping — the point-in-time recovery path.
+30 3 * * 0   root  cd $APP_DIR && ./basebackup.sh >> backups/basebackup.log 2>&1
+
+# Monthly unattended restore drill. Fails loudly (and POSTs to DRILL_ALERT_URL
+# when configured) if the newest backup cannot be restored, or if backups have
+# silently stopped and the newest one is stale.
+30 4 1 * *   root  cd $APP_DIR && ./backup-drill.sh >> backups/drill.log 2>&1

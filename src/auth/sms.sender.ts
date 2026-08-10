@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { assertNotProduction } from '../common/config/production-config.validator';
+import { MetricsService } from '../common/observability/metrics.service';
 
 export const SMS_SENDER = Symbol('SMS_SENDER');
 
@@ -39,7 +40,10 @@ export interface SmsSender {
 export class Msg91SmsSender implements SmsSender {
   private readonly logger = new Logger(Msg91SmsSender.name);
 
-  constructor(private readonly config: ConfigService) {}
+  constructor(
+    private readonly config: ConfigService,
+    private readonly metrics: MetricsService,
+  ) {}
 
   async sendOtp(mobile: string, otp: string): Promise<void> {
     const authKey = this.config.get<string>('MSG91_AUTH_KEY');
@@ -74,6 +78,7 @@ export class Msg91SmsSender implements SmsSender {
         headers: { authkey: authKey, accept: 'application/json' },
       });
     } catch (err) {
+      this.metrics.integrationCalls.inc({ provider: 'msg91', outcome: 'failure' });
       this.logger.error(`MSG91 request failed for ${maskMobile(recipient)}: ${(err as Error).message}`);
       throw err;
     }
@@ -88,10 +93,15 @@ export class Msg91SmsSender implements SmsSender {
       /* non-JSON body — fall through to status check */
     }
     if (!res.ok || type === 'error') {
+      // A provider that accepts the request and rejects it in the body is still
+      // a failure — this is the case a status-code-only metric would miss, and
+      // it is the one that silently stops every patient logging in.
+      this.metrics.integrationCalls.inc({ provider: 'msg91', outcome: 'failure' });
       this.logger.error(`MSG91 rejected OTP for ${maskMobile(recipient)}: ${res.status} ${bodyText}`);
       throw new Error(`MSG91 send failed: ${res.status}`);
     }
 
+    this.metrics.integrationCalls.inc({ provider: 'msg91', outcome: 'success' });
     this.logger.log(`OTP dispatched to ${maskMobile(recipient)} via MSG91`);
   }
 
@@ -132,6 +142,7 @@ export class Msg91SmsSender implements SmsSender {
         }),
       });
     } catch (err) {
+      this.metrics.integrationCalls.inc({ provider: 'msg91', outcome: 'failure' });
       this.logger.error(`MSG91 request failed for ${maskMobile(recipient)}: ${(err as Error).message}`);
       throw err;
     }

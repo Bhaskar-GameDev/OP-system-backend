@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { ScheduleModule } from '@nestjs/schedule';
 import { RedisModule } from './common/redis/redis.module';
@@ -33,6 +33,9 @@ import { ProfileModule } from './profile/profile.module';
 import { IntegrationsModule } from './integrations/integrations.module';
 import { VoiceModule } from './voice/voice.module';
 import { DisplayModule } from './display/display.module';
+import { ObservabilityModule } from './common/observability/observability.module';
+import { RequestContextMiddleware } from './common/observability/request-context.middleware';
+import { HttpMetricsMiddleware } from './common/observability/http-metrics.middleware';
 
 @Module({
   imports: [
@@ -70,6 +73,16 @@ import { DisplayModule } from './display/display.module';
     IntegrationsModule,
     VoiceModule,
     DisplayModule,
+    ObservabilityModule,
   ],
 })
-export class AppModule {}
+export class AppModule implements NestModule {
+  /**
+   * Applied to every route, including the public ones: a correlation id is
+   * useful precisely when the caller is anonymous, and the metrics recorder
+   * must not have a blind spot where the unauthenticated traffic lives.
+   */
+  configure(consumer: MiddlewareConsumer): void {
+    consumer.apply(RequestContextMiddleware, HttpMetricsMiddleware).forRoutes('*');
+  }
+}

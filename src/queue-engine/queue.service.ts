@@ -554,6 +554,19 @@ export class QueueService {
     return this.redisService.redis.hget(this.tokenMapKey(session), token);
   }
 
+  /**
+   * The whole token → bookingId map for a session, in ONE round trip.
+   *
+   * The realtime broadcast needs every entry's booking id on every queue
+   * mutation. Resolving them one at a time cost one Redis round trip per
+   * waiting patient, per broadcast, per active doctor — measured at exactly 30
+   * and 60 lookups for queues of those depths (see scripts/benchmark.ts). The
+   * mapping is already a single hash, so the batched read is a plain HGETALL.
+   */
+  async bookingIdsFor(session: SessionKey): Promise<Record<string, string>> {
+    return this.redisService.redis.hgetall(this.tokenMapKey(session));
+  }
+
   /** Drop a token's booking mapping (after it leaves the queue). */
   async unmapToken(token: string, session: SessionKey): Promise<void> {
     await this.redisService.redis.hdel(this.tokenMapKey(session), token);

@@ -1,0 +1,51 @@
+# Alertmanager configuration — EXAMPLE.
+#
+# Copy to alertmanager.yml (gitignored, because the real one carries a webhook
+# URL or SMTP credentials) and set a receiver that a HUMAN actually reads.
+#
+# The severity labels come from ops/prometheus/alerts.yml:
+#   severity: page  — wake someone. Patient-facing breakage or a security event.
+#   severity: warn  — look at it during the working day.
+#
+# Route `page` somewhere that interrupts (phone, pager, on-call rota) and `warn`
+# somewhere that does not. Sending both to the same inbox means the inbox gets
+# ignored, and then so does the page.
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: default-warn
+  group_by: [alertname, severity]
+  # Wait briefly before the first notification so a burst of related alerts
+  # arrives as one message rather than twenty.
+  group_wait: 30s
+  group_interval: 5m
+  # Do not re-notify constantly for an ongoing problem, but do re-notify: a
+  # single missed message must not mean the incident goes unnoticed.
+  repeat_interval: 4h
+  routes:
+    - matchers: [severity="page"]
+      receiver: oncall-page
+      group_wait: 10s
+      repeat_interval: 1h
+
+receivers:
+  - name: oncall-page
+    # REPLACE. Options that actually interrupt: PagerDuty, Opsgenie, a phone
+    # bridge, or an SMS gateway. A chat webhook only counts if someone is
+    # guaranteed to be looking at it.
+    webhook_configs:
+      - url: "https://REPLACE-ME.example/pfos-page"
+        send_resolved: true
+
+  - name: default-warn
+    webhook_configs:
+      - url: "https://REPLACE-ME.example/pfos-warn"
+        send_resolved: true
+
+inhibit_rules:
+  # If the backend is down, every downstream alert is a symptom of the same
+  # thing. Suppress them so the page says one clear thing.
+  - source_matchers: [alertname="BackendDown"]
+    target_matchers: [severity=~"page|warn"]
+    equal: [service]

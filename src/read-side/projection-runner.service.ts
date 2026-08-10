@@ -3,6 +3,7 @@ import { PrismaService } from '../common/prisma/prisma.service';
 import { EventStoreService } from '../event-store/event-store.service';
 import { ProjectionService } from './projection.service';
 import { NotificationDispatcher } from './notification-dispatcher.service';
+import { MetricsService } from '../common/observability/metrics.service';
 
 const CURSOR = 'queue_read_model';
 
@@ -19,6 +20,7 @@ export class ProjectionRunner {
     private readonly events: EventStoreService,
     private readonly projection: ProjectionService,
     private readonly notifications: NotificationDispatcher,
+    private readonly metrics: MetricsService,
   ) {}
 
   /** Process all events after the cursor. Returns how many were applied. */
@@ -46,7 +48,30 @@ export class ProjectionRunner {
       });
       if (events.length < 500) break;
     }
+    await this.recordLag(cursor);
     return total;
+  }
+
+  /**
+   * Publish how far the read models trail the event store.
+   *
+   * A stalled projection is a silent failure: every endpoint still answers 200
+   * while dashboards show the past, so nothing in the HTTP metrics moves. This
+   * gauge is the only signal that distinguishes "quiet clinic" from "projection
+   * stopped", which is why it is measured after every pass rather than sampled.
+   */
+  private async recordLag(cursor: bigint): Promise<void> {
+    try {
+      const latest = await this.prisma.domainEvent.findFirst({
+        orderBy: { globalSeq: 'desc' },
+        select: { globalSeq: true },
+      });
+      const head = latest?.globalSeq ?? 0n;
+      this.metrics.projectionLag.set(Number(head > cursor ? head - cursor : 0n));
+    } catch {
+      // Measurement must never break projection: the lag gauge going stale is a
+      // smaller problem than a read model that stops updating.
+    }
   }
 
   /**

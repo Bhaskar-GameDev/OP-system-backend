@@ -1,0 +1,63 @@
+# Patient Flow OS — STAGING overlay.
+#
+# Applied ON TOP of docker-compose.prod.yml, never instead of it:
+#
+#   docker compose -f docker-compose.prod.yml -f docker-compose.staging.yml \
+#     -p pfos-staging --env-file .env.staging up -d --build
+#
+# or simply: ./deploy.sh --staging --domain staging.api.myclinic.com
+#
+# WHY IT IS AN OVERLAY, NOT ITS OWN FILE
+#
+#   A staging environment that drifts from production tests the wrong thing. By
+#   inheriting the production file, staging gets the same images, the same
+#   hardening, the same entrypoint and the same healthchecks — the migration you
+#   rehearse here is the migration that will run there. This file changes only
+#   what MUST differ so both can exist on one host:
+#
+#     - container names (compose refuses two containers with the same name)
+#     - volumes (staging must never touch production data)
+#     - the seed, which stays off: staging runs NODE_ENV=production too, so the
+#       backend would refuse to start with SEED_ON_START=true anyway
+#
+# `!override` is required on every list. Compose MERGES list fields across files
+# by default, so without it staging would inherit the production volume mounted
+# at the same path AND try to bind ports 80/443 that production already holds.
+# Needs Docker Compose >= 2.24 (the deploy script already requires Compose v2).
+#
+# Staging is for REHEARSAL, not for real patients. Populate it from a restored
+# production backup when you need realistic data — restore-verify.sh shows the
+# decrypt/restore pipeline — and treat anything in it as disposable.
+services:
+  postgres:
+    container_name: pfos_staging_postgres
+    volumes: !override
+      - pfos_staging_pgdata:/var/lib/postgresql/data
+      - pfos_staging_wal_archive:/wal_archive
+
+  redis:
+    container_name: pfos_staging_redis
+    volumes: !override
+      - pfos_staging_redisdata:/data
+
+  backend:
+    container_name: pfos_staging_backend
+
+  caddy:
+    container_name: pfos_staging_caddy
+    # Distinct host ports so staging and production can share a VPS. Point
+    # staging.<domain> at this host and terminate its own certificate.
+    ports: !override
+      - "8080:80"
+      - "8443:443"
+    volumes: !override
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - pfos_staging_caddy_data:/data
+      - pfos_staging_caddy_config:/config
+
+volumes:
+  pfos_staging_pgdata:
+  pfos_staging_wal_archive:
+  pfos_staging_redisdata:
+  pfos_staging_caddy_data:
+  pfos_staging_caddy_config:

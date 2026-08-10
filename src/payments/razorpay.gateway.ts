@@ -6,6 +6,7 @@ import {
   isProduction,
   ProductionConfigError,
 } from '../common/config/production-config.validator';
+import { MetricsService } from '../common/observability/metrics.service';
 
 export const RAZORPAY_GATEWAY = Symbol('RAZORPAY_GATEWAY');
 
@@ -68,7 +69,16 @@ export class HttpRazorpayGateway implements RazorpayGateway {
   private readonly base = 'https://api.razorpay.com/v1';
   private readonly logger = new Logger(HttpRazorpayGateway.name);
 
-  constructor(private readonly config: ConfigService) {
+  /**
+   * `metrics` is optional because this gateway is built by a module factory
+   * rather than by Nest's injector, and several tests construct it directly to
+   * assert the production credential guard. A missing recorder must not turn
+   * those into failures — the counters are observability, not behaviour.
+   */
+  constructor(
+    private readonly config: ConfigService,
+    private readonly metrics?: MetricsService,
+  ) {
     // In production all three credentials must be present. Key id alone is not
     // enough: without KEY_SECRET and WEBHOOK_SECRET the two signature checks
     // would run against an empty key, and `hmacEquals` fails every request
@@ -98,6 +108,10 @@ export class HttpRazorpayGateway implements RazorpayGateway {
   private async parse<T>(res: Response, op: string): Promise<T> {
     const text = await res.text();
     if (!res.ok) {
+      // Payment-provider failures are business-critical and invisible in HTTP
+      // metrics: a failed order creation surfaces to the patient as a generic
+      // error on our own route, with nothing naming Razorpay as the cause.
+      this.metrics?.integrationCalls.inc({ provider: 'razorpay', outcome: 'failure' });
       this.logger.error(`Razorpay ${op} failed: ${res.status} ${text}`);
       let description = `HTTP ${res.status}`;
       try {
@@ -108,6 +122,7 @@ export class HttpRazorpayGateway implements RazorpayGateway {
       }
       throw new Error(`Razorpay ${op} failed: ${description}`);
     }
+    this.metrics?.integrationCalls.inc({ provider: 'razorpay', outcome: 'success' });
     return JSON.parse(text) as T;
   }
 

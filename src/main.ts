@@ -4,6 +4,10 @@ import { ConfigService } from '@nestjs/config';
 import { AppModule } from './app.module';
 import { AllExceptionsFilter } from './common/errors/all-exceptions.filter';
 import { validateProductionConfig } from './common/config/production-config.validator';
+import { parseCorsOrigins } from './common/config/cors-origins';
+import { httpSecurityMiddleware } from './common/security/http-security';
+import { createLogger } from './common/observability/json-logger';
+import { RedisIoAdapter } from './queue-engine/redis-io.adapter';
 
 async function bootstrap(): Promise<void> {
   // FAIL CLOSED. Runs before the Nest container exists, so a production process
@@ -13,11 +17,19 @@ async function bootstrap(): Promise<void> {
 
   // rawBody: true preserves the raw request buffer for Razorpay webhook
   // signature verification (must hash the exact bytes Razorpay signed).
-  const app = await NestFactory.create(AppModule, { rawBody: true });
+  // Production emits one JSON object per log line, each carrying the request id
+  // from the surrounding request context; development keeps Nest's readable
+  // output. See common/observability/json-logger.
+  const app = await NestFactory.create(AppModule, {
+    rawBody: true,
+    logger: createLogger(),
+  });
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
   // Catches everything a controller/service throws that isn't an HttpException,
   // so no Prisma/driver internals ever reach a client as a raw 500 body.
   app.useGlobalFilters(new AllExceptionsFilter());
+
+  app.use(httpSecurityMiddleware());
 
   const config = app.get(ConfigService);
   const port = config.get<number>('PORT', 3000);
@@ -37,19 +49,20 @@ async function bootstrap(): Promise<void> {
   // CORS: every client (Tauri reception app, web preview/testing, future RN
   // patient app) otherwise hits a missing-CORS wall. Configure the real allowed
   // origins via CORS_ORIGINS (comma-separated). Defaults cover local dev only.
-  const corsOrigins = (
-    config.get<string>('CORS_ORIGINS') ??
-    'http://localhost:1420,http://tauri.localhost,https://tauri.localhost'
-  )
-    .split(',')
-    .map((o) => o.trim())
-    .filter((o) => o.length > 0);
+  const corsOrigins = parseCorsOrigins(config.get<string>('CORS_ORIGINS'));
   app.enableCors({
     origin: corsOrigins,
     methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: true,
   });
+
+  // Realtime fan-out through Redis rather than process memory. Installed even
+  // on a single instance: adding a replica later must not silently break the
+  // dashboards connected to the other one.
+  const ioAdapter = new RedisIoAdapter(app);
+  await ioAdapter.connect();
+  app.useWebSocketAdapter(ioAdapter);
 
   // Shut down cleanly on SIGTERM/SIGINT so Nest runs onModuleDestroy hooks —
   // Prisma disconnects and Redis clients close instead of being severed

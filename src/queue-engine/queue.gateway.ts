@@ -10,6 +10,7 @@ import {
   WebSocketGateway,
   WebSocketServer,
 } from '@nestjs/websockets';
+import { Interval } from '@nestjs/schedule';
 import type { Server, Socket } from 'socket.io';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { TenantService } from '../common/tenant/tenant.service';
@@ -17,6 +18,9 @@ import {
   AuthTokenService,
   SessionClaims,
 } from '../auth/auth-token.service';
+import { SessionRevocationService } from '../auth/session-revocation.service';
+import { parseCorsOrigins } from '../common/config/cors-origins';
+import { MetricsService } from '../common/observability/metrics.service';
 import { DisplayService } from '../display/display.service';
 import { QueueReadService } from '../read-side/queue-read.service';
 import { EtaService } from './eta.service';
@@ -45,6 +49,9 @@ const opSessionRoom = (opSessionId: string): string =>
 const opEncounterRoom = (encounterId: string): string =>
   `${OP_ENCOUNTER_PREFIX}${encounterId}`;
 
+/** How often live sockets are re-checked for an expired or revoked session. */
+const SESSION_SWEEP_INTERVAL_MS = 60_000;
+
 interface OpJoinPayload {
   kind: 'session' | 'encounter';
   opSessionId?: string; // kind: 'session'
@@ -66,7 +73,13 @@ interface OpJoinPayload {
  * authorized against the token's role + scope. On every join (so: on connect AND
  * reconnect) an immediate snapshot is pushed before any future delta event.
  */
-@WebSocketGateway({ cors: { origin: '*' } })
+/**
+ * The origin allowlist is read from the environment here rather than through
+ * ConfigService because a decorator is evaluated when the class is defined,
+ * before any Nest container exists. Same parser as the HTTP layer, so the two
+ * cannot drift apart again.
+ */
+@WebSocketGateway({ cors: { origin: parseCorsOrigins(process.env.CORS_ORIGINS) } })
 export class QueueGateway
   implements OnGatewayConnection, OnModuleInit, OnModuleDestroy
 {
@@ -80,6 +93,8 @@ export class QueueGateway
 
   constructor(
     private readonly auth: AuthTokenService,
+    private readonly revocation: SessionRevocationService,
+    private readonly metrics: MetricsService,
     private readonly eta: EtaService,
     private readonly queue: QueueService,
     private readonly events: QueueEventsService,
@@ -111,12 +126,89 @@ export class QueueGateway
       return;
     }
 
+    // Kept as a promise on the socket: verification is asynchronous now (the
+    // revocation check is a Redis read), and a client that emits `join`
+    // immediately after connecting would otherwise be handled before its own
+    // claims exist. Every join awaits this first.
+    client.data.ready = this.authenticate(client);
+  }
+
+  /**
+   * Verify the handshake token and keep it on the socket.
+   *
+   * The raw token is retained (not just the decoded claims) because a socket
+   * outlives a single check: connect-time verification alone meant a session
+   * opened at 09:00 kept streaming the clinic's queue at 18:00, hours past the
+   * token's own expiry and past any logout. Keeping the token lets every later
+   * join re-run the same verification the HTTP guard does.
+   */
+  private async authenticate(client: Socket): Promise<boolean> {
     try {
       const token = extractToken(client);
-      client.data.claims = this.auth.verify(token);
+      const claims = this.auth.verify(token); // signature + exp
+      await this.revocation.assertActive(claims); // logout / password change
+      // Counted once per socket, not per re-verification: joins re-run this
+      // method, and a gauge that climbed on every join would measure clicks
+      // rather than connections.
+      if (!client.data.counted) {
+        client.data.counted = true;
+        this.metrics.socketConnections.inc({ role: claims.role });
+        client.on('disconnect', () =>
+          this.metrics.socketConnections.dec({ role: claims.role }),
+        );
+      }
+      client.data.token = token;
+      client.data.claims = claims;
+      return true;
     } catch {
       client.emit('error', { message: 'unauthorized' });
       client.disconnect(true);
+      return false;
+    }
+  }
+
+  /**
+   * Claims for a socket that is still entitled to them, re-checked now.
+   *
+   * Every join re-verifies rather than trusting what connect-time verification
+   * left on the socket, because the two moments can be hours apart. Returns
+   * undefined once the socket has been disconnected, so callers just return.
+   */
+  private async currentClaims(client: Socket): Promise<SessionClaims | undefined> {
+    // Connect-time verification may still be in flight; its outcome decides
+    // whether this socket has claims at all.
+    if (client.data.ready) await (client.data.ready as Promise<boolean>);
+    if (!client.data.claims) {
+      client.disconnect(true);
+      return undefined;
+    }
+    if (!(await this.authenticate(client))) return undefined;
+    return client.data.claims as SessionClaims;
+  }
+
+  /**
+   * Disconnect authenticated sockets whose session has ended.
+   *
+   * Re-checking on join is not enough on its own: a staff dashboard joins once
+   * and then sits there receiving deltas for as long as it stays connected, so
+   * without a sweep an expired or revoked session keeps streaming the live queue
+   * until the socket happens to drop. The interval bounds that window to a
+   * minute. Displays are skipped — they hold no claims and carry no patient
+   * identity by design.
+   */
+  @Interval(SESSION_SWEEP_INTERVAL_MS)
+  async sweepExpiredSockets(): Promise<void> {
+    if (!this.server) return;
+    for (const client of this.server.sockets.sockets.values()) {
+      const claims = client.data.claims as SessionClaims | undefined;
+      if (!claims) continue; // display board, or a socket already being closed
+      try {
+        this.auth.verify(client.data.token as string); // expiry + signature
+        await this.revocation.assertActive(claims);
+      } catch {
+        client.emit('error', { message: 'session expired' });
+        client.disconnect(true);
+      }
     }
   }
 
@@ -130,11 +222,8 @@ export class QueueGateway
       return;
     }
 
-    const claims = client.data.claims as SessionClaims | undefined;
-    if (!claims) {
-      client.disconnect(true);
-      return;
-    }
+    const claims = await this.currentClaims(client);
+    if (!claims) return;
     if (!payload?.doctorId || !payload?.sessionDate || !payload?.sessionType) {
       client.emit('error', { message: 'doctorId, sessionDate, sessionType required' });
       return;
@@ -261,10 +350,15 @@ export class QueueGateway
     // full state to the session room (staff)
     this.server.to(sessionRoom(session)).emit('queue:update', { session, queue });
 
-    // each patient gets ONLY their own slice on their private channel
+    // each patient gets ONLY their own slice on their private channel.
+    // One HGETALL for the whole session rather than one HGET per waiting
+    // patient: this loop runs on every queue mutation, for every active doctor,
+    // and the per-entry version measured 30 and 60 Redis round trips at those
+    // queue depths.
+    const bookingIds = await this.queue.bookingIdsFor(session);
     const current = new Set<string>();
     for (const entry of queue) {
-      const bookingId = await this.queue.bookingIdFor(entry.tokenNumber, session);
+      const bookingId = bookingIds[entry.tokenNumber];
       if (bookingId) {
         current.add(bookingId);
         this.server
@@ -289,11 +383,37 @@ export class QueueGateway
       }
     }
     this.lastSessionBookings.set(tag, current);
+    this.evictStaleSessions(session.sessionDate);
 
     // Waiting-room screens go last: a wall display is the least latency-critical
     // consumer, and the staff and patient fan-outs above must not queue behind
     // the projection this builds.
     await this.broadcastDisplay(session);
+  }
+
+  /**
+   * Drop tracking for sessions from earlier days.
+   *
+   * `lastSessionBookings` is keyed by `session:{doctorId}:{date}:{type}`, so
+   * every doctor adds a new permanent entry every day and nothing ever removed
+   * one. A year of 50 doctors is ~18,000 retained sets, each holding a full
+   * session's booking ids — slow growth that ends in an OOM restart mid-clinic.
+   *
+   * A session's entry is only useful while that session is live: its purpose is
+   * to notice which bookings LEFT the queue since the previous broadcast. Once
+   * the date has passed there is no next broadcast to compare against.
+   *
+   * Runs inline off the broadcast that just happened rather than on a timer:
+   * the map only grows when a broadcast writes to it, so that is exactly when
+   * it is worth checking, and it costs a key scan of an already-small map.
+   */
+  private evictStaleSessions(currentDate: string): void {
+    for (const key of this.lastSessionBookings.keys()) {
+      // key shape: session:{doctorId}:{sessionDate}:{sessionType}
+      const parts = key.split(':');
+      const date = parts[parts.length - 2];
+      if (date && date < currentDate) this.lastSessionBookings.delete(key);
+    }
   }
 
   /**
@@ -340,11 +460,8 @@ export class QueueGateway
       client.emit('error', { message: 'forbidden' });
       return;
     }
-    const claims = client.data.claims as SessionClaims | undefined;
-    if (!claims) {
-      client.disconnect(true);
-      return;
-    }
+    const claims = await this.currentClaims(client);
+    if (!claims) return;
     try {
       if (payload?.kind === 'session' && payload.opSessionId) {
         await this.tenant.assertSessionAccess(claims, payload.opSessionId);
@@ -466,12 +583,18 @@ function extractDisplayClinic(client: Socket): string | null {
   return null;
 }
 
+/**
+ * Session token from the handshake — `auth` payload or Authorization header.
+ *
+ * The query-string fallback was removed deliberately. A credential in a query
+ * string is written to proxy access logs, browser history and referrer headers,
+ * which are not places designed to hold one, and every client here already
+ * sends the token in the handshake `auth` payload.
+ */
 function extractToken(client: Socket): string {
   const auth = client.handshake.auth as { token?: string } | undefined;
   if (auth?.token) return auth.token;
   const header = client.handshake.headers.authorization;
   if (header?.startsWith('Bearer ')) return header.slice(7);
-  const q = client.handshake.query?.token;
-  if (typeof q === 'string') return q;
   throw new Error('no token');
 }

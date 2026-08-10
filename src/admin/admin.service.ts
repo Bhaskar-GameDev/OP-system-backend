@@ -9,6 +9,7 @@ import { PrismaService } from '../common/prisma/prisma.service';
 import { DAILY_SESSION_TYPE } from '../common/session/daily-session';
 import { TenantService } from '../common/tenant/tenant.service';
 import { PasswordService } from '../auth/password.service';
+import { AuthService } from '../auth/auth.service';
 import {
   AdminClinicView,
   AdminDoctorSessionView,
@@ -90,6 +91,7 @@ export class AdminService {
     private readonly prisma: PrismaService,
     private readonly passwords: PasswordService,
     private readonly tenant: TenantService,
+    private readonly auth: AuthService,
   ) {}
 
   // ─── Clinic (edit-only, own clinic) ───
@@ -268,12 +270,20 @@ export class AdminService {
       data,
       select: DOCTOR_SELECT,
     });
+
+    // Changing the credential is how an admin responds to a suspected
+    // compromise. Without this the old sessions keep working for up to their
+    // full hour, which would make the password change cosmetic.
+    if (input.password !== undefined || input.username !== undefined) {
+      await this.auth.revokeAllSessionsFor(doctorId);
+    }
     return toAdminDoctor(updated);
   }
 
   async deleteDoctor(clinicId: string, doctorId: string): Promise<void> {
     await this.loadOwnDoctor(clinicId, doctorId); // 403/404 before deleting
     await this.prisma.doctor.delete({ where: { id: doctorId } });
+    await this.auth.revokeAllSessionsFor(doctorId);
   }
 
   // ─── Staff CRUD (own clinic) ───
@@ -329,12 +339,24 @@ export class AdminService {
       data,
       select: STAFF_SELECT,
     });
+
+    // Role travels inside the access token, so a demotion from ADMIN to STAFF
+    // is not effective until the existing sessions end — same reasoning as a
+    // password change.
+    if (
+      input.password !== undefined ||
+      input.username !== undefined ||
+      input.role !== undefined
+    ) {
+      await this.auth.revokeAllSessionsFor(staffId);
+    }
     return toAdminStaff(updated);
   }
 
   async deleteStaff(clinicId: string, staffId: string): Promise<void> {
     await this.loadOwnStaff(clinicId, staffId);
     await this.prisma.staff.delete({ where: { id: staffId } });
+    await this.auth.revokeAllSessionsFor(staffId);
   }
 
   // ─── Doctor session schedule (per doctor, own clinic) ───

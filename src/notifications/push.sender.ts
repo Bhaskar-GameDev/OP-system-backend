@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { MetricsService } from '../common/observability/metrics.service';
 
 export const PUSH_SENDER = Symbol('PUSH_SENDER');
 
@@ -95,7 +96,10 @@ export class FcmPushSender implements PushSender {
   private messaging?: FirebaseMessaging;
   private initFailed = false;
 
-  constructor(private readonly config: ConfigService) {}
+  constructor(
+    private readonly config: ConfigService,
+    private readonly metrics: MetricsService,
+  ) {}
 
   async send(
     deviceToken: string,
@@ -104,6 +108,11 @@ export class FcmPushSender implements PushSender {
   ): Promise<void> {
     const messaging = await this.getMessaging();
     if (!messaging) {
+      // Counted, not just logged: push failures are swallowed by the caller by
+      // design (a provider outage must not undo a booking), so without this
+      // metric an unconfigured FCM means patients are never told their turn is
+      // approaching and nothing anywhere says so.
+      this.metrics.integrationCalls.inc({ provider: 'fcm', outcome: 'not_configured' });
       this.logger.warn(
         `FCM not configured; would push "${message.title}" to ${deviceToken.slice(0, 8)}…`,
       );
@@ -113,11 +122,13 @@ export class FcmPushSender implements PushSender {
     try {
       await messaging.send(buildFcmMessage(deviceToken, message, platform));
     } catch (err) {
+      this.metrics.integrationCalls.inc({ provider: 'fcm', outcome: 'failure' });
       this.logger.error(
         `FCM send failed for ${deviceToken.slice(0, 8)}…: ${(err as Error).message}`,
       );
       throw err;
     }
+    this.metrics.integrationCalls.inc({ provider: 'fcm', outcome: 'success' });
     this.logger.log(`Push "${message.title}" dispatched to ${deviceToken.slice(0, 8)}… via FCM`);
   }
 

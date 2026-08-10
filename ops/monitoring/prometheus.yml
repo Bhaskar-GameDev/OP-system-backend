@@ -1,0 +1,37 @@
+# Prometheus configuration for the monitoring stack in this directory.
+#
+# The scrape credential is NOT in this file. Prometheus does not expand
+# environment variables inside scrape configs, and a committed config should not
+# carry a secret anyway — so the token is mounted as a gitignored file and
+# referenced with `credentials_file`. Create it from .env.production; see
+# ./README.md.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    environment: production
+    service: patient-flow-os
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  - job_name: "pfos-backend"
+    metrics_path: /metrics
+    static_configs:
+      # Reached over the backend's internal compose network. The backend
+      # publishes no host port, and scraping through Caddy would put internal
+      # route names and error rates on the public internet.
+      - targets: ["backend:3000"]
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/metrics_token
+
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
