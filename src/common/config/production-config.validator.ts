@@ -50,6 +50,14 @@ export const REQUIRED_PRODUCTION_VARS = [
 export const MIN_JWT_SECRET_LENGTH = 32;
 
 /**
+ * Minimum entropy for HOSPITAL_SETUP_KEY. Optional (absent = the tenant-setup
+ * route is disabled), but when present it is the ONLY thing standing in front of
+ * an unauthenticated route that creates a hospital and an ADMIN login, so a short
+ * or placeholder value is worse than not having the feature at all.
+ */
+export const MIN_SETUP_KEY_LENGTH = 32;
+
+/**
  * Values that must never sign a production token. These are the strings this
  * repository has actually shipped as defaults or templates plus the obvious
  * placeholders; matching is case-insensitive and whitespace-trimmed so
@@ -90,6 +98,23 @@ export function jwtSecretProblem(secret: string | undefined): string | null {
   return null;
 }
 
+/**
+ * Reject a tenant-setup key that is too short or a known placeholder. Absence is
+ * fine and is NOT a problem — it simply means POST /setup/hospital is disabled.
+ * Returns null when acceptable, otherwise a reason with NO value in it.
+ */
+export function setupKeyProblem(key: string | undefined): string | null {
+  const value = (key ?? '').trim();
+  if (value.length === 0) return null; // feature off, nothing to validate
+  if (UNSAFE_SECRET_VALUES.has(value.toLowerCase())) {
+    return 'HOSPITAL_SETUP_KEY is a known development placeholder';
+  }
+  if (value.length < MIN_SETUP_KEY_LENGTH) {
+    return `HOSPITAL_SETUP_KEY must be at least ${MIN_SETUP_KEY_LENGTH} characters`;
+  }
+  return null;
+}
+
 /** Join names the way a human would read them: "A", "A and B", "A, B and C". */
 function humanList(names: string[]): string {
   if (names.length <= 1) return names.join('');
@@ -117,6 +142,9 @@ export function validateProductionConfig(env: NodeJS.ProcessEnv = process.env): 
 
   const jwtProblem = jwtSecretProblem(env.JWT_SECRET);
   if (jwtProblem) insecure.push(jwtProblem);
+
+  const setupProblem = setupKeyProblem(env.HOSPITAL_SETUP_KEY);
+  if (setupProblem) insecure.push(setupProblem);
 
   // Seeding in production creates predictable staff accounts and issues
   // deleteMany against live rows (see prisma/seed.ts). The seed script refuses

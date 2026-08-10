@@ -131,6 +131,12 @@ describe('Audit log read API (full stack)', () => {
     return fetch(`${url}/audit-log${query}`, { headers: { authorization: `Bearer ${token}` } });
   }
 
+  function exportCsv(token: string, query = '') {
+    return fetch(`${url}/audit-log/export${query}`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+  }
+
   it('clinic-scoped, newest-first, with staff + patient name enrichment', async () => {
     const res = await list(staffAToken);
     expect(res.status).toBe(200);
@@ -196,6 +202,76 @@ describe('Audit log read API (full stack)', () => {
     };
     expect(page.total).toBe(1);
     expect(page.entries[0].token).toBe('B001');
+  });
+
+  it('accepts every action the trail records, not just the queue-control ones', async () => {
+    // CANCEL/RESCHEDULE are patient-initiated but still audited, so filtering by
+    // them must not come back 400.
+    expect((await list(staffAToken, '?action=CANCEL')).status).toBe(200);
+    expect((await list(staffAToken, '?action=RESCHEDULE')).status).toBe(200);
+  });
+
+  describe('CSV export', () => {
+    it('serves the whole range as a CSV attachment, unpaginated', async () => {
+      const res = await exportCsv(staffAToken);
+      expect(res.status).toBe(200);
+      expect(res.headers.get('content-type')).toContain('text/csv');
+      expect(res.headers.get('content-disposition')).toContain('attachment');
+
+      const lines = (await res.text()).trim().split('\r\n');
+      // header + all 5 Clinic A rows (the list default page size is 25, but the
+      // point here is that no limit/offset is involved)
+      expect(lines[0]).toBe(
+        'recorded_at,staff,role,action,token,patient,doctor,session_date,session_type,metadata',
+      );
+      expect(lines).toHaveLength(6);
+      // newest-first, same order as the list
+      expect(lines[1]).toContain('A005');
+      expect(lines[1]).toContain('Reception A');
+      expect(lines[1]).toContain('Dr A');
+      // enrichment carries into the file
+      expect(lines.find((l) => l.includes('A001'))).toContain('Asha Rao');
+    });
+
+    it('honours the action filter', async () => {
+      const lines = (await (await exportCsv(staffAToken, '?action=SKIP')).text())
+        .trim()
+        .split('\r\n');
+      expect(lines).toHaveLength(3); // header + 2 SKIP rows
+      expect(lines.slice(1).every((l) => l.includes('SKIP'))).toBe(true);
+    });
+
+    it('honours the date range, exclusive on dateTo', async () => {
+      // rows are 08:00..08:04Z on 2026-06-20; an upper bound of 08:02 keeps 2
+      const body = await (
+        await exportCsv(
+          staffAToken,
+          '?dateFrom=2026-06-20T08:00:00.000Z&dateTo=2026-06-20T08:02:00.000Z',
+        )
+      ).text();
+      const lines = body.trim().split('\r\n');
+      expect(lines).toHaveLength(3); // header + A001, A002
+      expect(body).not.toContain('A003');
+    });
+
+    it('header only when nothing matches — never another clinic’s rows', async () => {
+      const body = await (
+        await exportCsv(staffAToken, '?dateFrom=2030-01-01&dateTo=2030-01-02')
+      ).text();
+      expect(body.trim().split('\r\n')).toHaveLength(1);
+
+      // Clinic B staff export their single row and never A's
+      const bBody = await (await exportCsv(staffBToken)).text();
+      expect(bBody).toContain('B001');
+      expect(bBody).not.toContain('A005');
+    });
+
+    it('rejects a bad filter (400) and a patient token (403)', async () => {
+      expect((await exportCsv(staffAToken, '?action=BOGUS')).status).toBe(400);
+      const patient = tokens.sign({ sub: PATIENT, role: 'PATIENT' });
+      expect((await exportCsv(patient)).status).toBe(403);
+      expect((await fetch(`${url}/audit-log/export`)).status).toBe(401);
+    });
   });
 
   it('role guard: no token -> 401, patient -> 403', async () => {

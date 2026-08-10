@@ -15,6 +15,7 @@ import { TenantScopeGuard, tenantHospitalId } from '../common/tenant/tenant-scop
 import { TenantService } from '../common/tenant/tenant.service';
 import { ReportsService } from './reports.service';
 import { ReportBucket } from './reports.dto';
+import { toCsv } from '../common/csv';
 
 /**
  * Operational reporting surface. ADMIN sees their whole HOSPITAL (every clinic
@@ -83,8 +84,9 @@ export class ReportsController {
       'booked_at',
       'consultation_started_at',
     ];
-    const lines = rows.map((r) =>
-      [
+    return toCsv(
+      header,
+      rows.map((r) => [
         ymd(r.session_date),
         r.doctor_name,
         r.source,
@@ -94,11 +96,8 @@ export class ReportsController {
         (Math.round(r.revenue_paise) / 100).toFixed(2),
         iso(r.booked_at),
         iso(r.started_at),
-      ]
-        .map(csvCell)
-        .join(','),
+      ]),
     );
-    return [header.join(','), ...lines].join('\r\n');
   }
 }
 
@@ -123,9 +122,4 @@ function ymd(d: Date): string {
 
 function iso(d: Date | null): string {
   return d ? d.toISOString() : '';
-}
-
-/** RFC-4180 quoting: wrap in quotes and double embedded quotes when needed. */
-function csvCell(value: string): string {
-  return /[",\r\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
 }

@@ -4,8 +4,10 @@ import {
   isProduction,
   jwtSecretProblem,
   MIN_JWT_SECRET_LENGTH,
+  MIN_SETUP_KEY_LENGTH,
   ProductionConfigError,
   REQUIRED_PRODUCTION_VARS,
+  setupKeyProblem,
   validateProductionConfig,
 } from '../src/common/config/production-config.validator';
 import { AuthTokenService } from '../src/auth/auth-token.service';
@@ -107,6 +109,51 @@ describe('validateProductionConfig', () => {
   it('allows SEED_ON_START=false in production', () => {
     const env = { ...validProdEnv(), SEED_ON_START: 'false' };
     expect(() => validateProductionConfig(env)).not.toThrow();
+  });
+});
+
+/**
+ * HOSPITAL_SETUP_KEY guards POST /setup/hospital, an unauthenticated route that
+ * creates a tenant and an ADMIN login. Absent is fine (the route is disabled);
+ * present-but-weak is worse than not having the feature, so it must stop the boot.
+ */
+describe('setupKeyProblem', () => {
+  it('accepts absence — the setup route is simply switched off', () => {
+    expect(setupKeyProblem(undefined)).toBeNull();
+    expect(setupKeyProblem('')).toBeNull();
+    expect(setupKeyProblem('   ')).toBeNull();
+  });
+
+  it('accepts a sufficiently long key', () => {
+    expect(setupKeyProblem('k'.repeat(MIN_SETUP_KEY_LENGTH))).toBeNull();
+  });
+
+  it('rejects a short key', () => {
+    const problem = setupKeyProblem('k'.repeat(MIN_SETUP_KEY_LENGTH - 1));
+    expect(problem).toContain('HOSPITAL_SETUP_KEY');
+    expect(problem).toContain(String(MIN_SETUP_KEY_LENGTH));
+  });
+
+  it('rejects a known placeholder even at sufficient length', () => {
+    expect(setupKeyProblem('changeme')).toContain('placeholder');
+  });
+
+  it('stops a production boot, and never echoes the key', () => {
+    const env = { ...validProdEnv(), HOSPITAL_SETUP_KEY: 'short-key' };
+    expect(() => validateProductionConfig(env)).toThrow(ProductionConfigError);
+    try {
+      validateProductionConfig(env);
+    } catch (e) {
+      expect((e as Error).message).not.toContain('short-key');
+    }
+
+    // a strong key boots normally
+    expect(() =>
+      validateProductionConfig({
+        ...validProdEnv(),
+        HOSPITAL_SETUP_KEY: 'z'.repeat(MIN_SETUP_KEY_LENGTH + 4),
+      }),
+    ).not.toThrow();
   });
 });
 

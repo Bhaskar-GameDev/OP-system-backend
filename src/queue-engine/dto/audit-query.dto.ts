@@ -14,6 +14,12 @@ export interface AuditQuery {
   dateTo?: Date; // exclusive upper bound, on createdAt
 }
 
+/**
+ * Same filters as {@link AuditQuery} for the CSV export, minus pagination — an
+ * export always covers the whole matching range (the caller picks the range).
+ */
+export type AuditExportQuery = Omit<AuditQuery, 'limit' | 'offset'>;
+
 /** One audit row, enriched with the names the desk needs to read it. */
 export interface AuditLogView {
   id: string;

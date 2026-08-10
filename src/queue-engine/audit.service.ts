@@ -1,13 +1,28 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import { Prisma, SessionType } from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { TenantService } from '../common/tenant/tenant.service';
 import { SessionClaims } from '../auth/auth-token.service';
 import {
+  AuditExportQuery,
   AuditLogPage,
   AuditLogView,
   AuditQuery,
 } from './dto/audit-query.dto';
+
+/**
+ * Page size used to walk the trail for an export. Keeps each read's batched
+ * name-resolution `in (...)` bounded instead of building one with every id in
+ * the range.
+ */
+const EXPORT_CHUNK = 2000;
+
+/**
+ * Hard ceiling on a single export. Past this we refuse — a silently truncated
+ * compliance export is worse than a failed one, because nothing on the file
+ * says rows are missing.
+ */
+const EXPORT_MAX_ROWS = 20_000;
 
 export type AuditAction =
   | 'DONE'
@@ -108,7 +123,10 @@ export class AuditService {
       this.prisma.auditLog.count({ where }),
       this.prisma.auditLog.findMany({
         where,
-        orderBy: { createdAt: 'desc' },
+        // id breaks ties so rows written in the same millisecond keep a stable
+        // order across pages — otherwise paging (and the chunked export below)
+        // can repeat or skip a row.
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
         skip: q.offset,
         take: q.limit,
       }),
@@ -181,6 +199,42 @@ export class AuditService {
     }));
 
     return { entries, total, limit: q.limit, offset: q.offset };
+  }
+
+  /**
+   * Every row matching the filters, for a CSV export — same tenant scoping and
+   * same name enrichment as {@link query}, just unpaginated. Walked in chunks so
+   * one export cannot build an unbounded query, and refused outright past
+   * EXPORT_MAX_ROWS rather than handing back a file that is quietly incomplete.
+   */
+  async exportEntries(
+    actor: SessionClaims,
+    filters: AuditExportQuery,
+  ): Promise<AuditLogView[]> {
+    const first = await this.query(actor, {
+      ...filters,
+      limit: EXPORT_CHUNK,
+      offset: 0,
+    });
+    if (first.total > EXPORT_MAX_ROWS) {
+      throw new BadRequestException(
+        `this range holds ${first.total} entries; an export is capped at ${EXPORT_MAX_ROWS} — narrow the date range`,
+      );
+    }
+
+    const entries = [...first.entries];
+    while (entries.length < first.total) {
+      const next = await this.query(actor, {
+        ...filters,
+        limit: EXPORT_CHUNK,
+        offset: entries.length,
+      });
+      // An empty page before reaching `total` means the trail moved under us
+      // (concurrent writes shift offsets). Stop rather than loop forever.
+      if (!next.entries.length) break;
+      entries.push(...next.entries);
+    }
+    return entries;
   }
 
   /**

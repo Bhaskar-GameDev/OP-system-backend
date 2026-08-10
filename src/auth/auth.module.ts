@@ -32,6 +32,10 @@ import { AuthController } from './auth.controller';
     AuthTokenService,
     AuthService,
     SessionRevocationService,
+    // Exported so the hospital-setup route can throttle setup-key guessing with
+    // the same control that protects privileged logins.
+    LoginThrottleService,
+    PasswordService,
     JwtAuthGuard,
     RolesGuard,
   ],

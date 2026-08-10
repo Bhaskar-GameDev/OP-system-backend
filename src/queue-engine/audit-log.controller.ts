@@ -2,6 +2,7 @@ import {
   BadRequestException,
   Controller,
   Get,
+  Header,
   Query,
   Req,
   UseGuards,
@@ -11,12 +12,37 @@ import { SessionClaims } from '../auth/auth-token.service';
 import { RolesGuard } from '../auth/roles.guard';
 import { Roles } from '../auth/roles.decorator';
 import { TenantScopeGuard } from '../common/tenant/tenant-scope';
+import { toCsv } from '../common/csv';
 import { AuditAction, AuditService } from './audit.service';
-import { AuditQuery } from './dto/audit-query.dto';
+import { AuditExportQuery, AuditQuery } from './dto/audit-query.dto';
 
-const ACTIONS: AuditAction[] = ['DONE', 'NO_SHOW', 'SKIP', 'PRIORITY', 'REINSERT'];
+// Must stay in step with the AuditAction union — CANNOT be a subset of it, or
+// filtering by an action the trail actually records is rejected as invalid.
+const ACTIONS: AuditAction[] = [
+  'DONE',
+  'NO_SHOW',
+  'SKIP',
+  'PRIORITY',
+  'REINSERT',
+  'CANCEL',
+  'RESCHEDULE',
+];
 const MAX_LIMIT = 100;
 const DEFAULT_LIMIT = 25;
+
+/** Column order of the CSV export. Stable — downstream sheets rely on it. */
+const CSV_HEADER = [
+  'recorded_at',
+  'staff',
+  'role',
+  'action',
+  'token',
+  'patient',
+  'doctor',
+  'session_date',
+  'session_type',
+  'metadata',
+];
 
 /**
  * Read surface for the compliance trail. Staff/doctor only (never patients).
@@ -50,6 +76,49 @@ export class AuditLogController {
       dateTo: this.parseDate('dateTo', dateTo),
     };
     return this.audit.query(actor, q);
+  }
+
+  /**
+   * GET /audit-log/export?action&actorId&dateFrom&dateTo — the same rows the
+   * list returns, as a CSV attachment, unpaginated over the requested range.
+   * The caller supplies the range (the desk app derives day/week/month from the
+   * clinic's local calendar); scope stays token-derived inside AuditService.
+   */
+  @Get('export')
+  @Header('Content-Type', 'text/csv; charset=utf-8')
+  @Header('Content-Disposition', 'attachment; filename="audit-log.csv"')
+  async exportCsv(
+    @Req() req: AuthedRequest,
+    @Query('action') action?: string,
+    @Query('actorId') actorId?: string,
+    @Query('dateFrom') dateFrom?: string,
+    @Query('dateTo') dateTo?: string,
+  ): Promise<string> {
+    const filters: AuditExportQuery = {
+      action: this.parseAction(action),
+      actorId: actorId || undefined,
+      dateFrom: this.parseDate('dateFrom', dateFrom),
+      dateTo: this.parseDate('dateTo', dateTo),
+    };
+    const entries = await this.audit.exportEntries(
+      req.user as SessionClaims,
+      filters,
+    );
+    return toCsv(
+      CSV_HEADER,
+      entries.map((e) => [
+        e.timestamp,
+        e.staffName ?? '',
+        e.staffRole,
+        e.action,
+        e.token ?? '',
+        e.patientName ?? '',
+        e.doctorName ?? e.doctorId,
+        e.sessionDate,
+        e.sessionType,
+        e.metadata ? JSON.stringify(e.metadata) : '',
+      ]),
+    );
   }
 
   private parseLimit(raw?: string): number {

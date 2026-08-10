@@ -4,8 +4,9 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { Prisma, QueuePolicyMode, TokenResetPolicy } from '@prisma/client';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
+import { provisionClinicOpConfig } from '../common/provisioning/clinic-op-config';
 import { DAILY_SESSION_TYPE } from '../common/session/daily-session';
 import { TenantService } from '../common/tenant/tenant.service';
 import { PasswordService } from '../auth/password.service';
@@ -173,38 +174,9 @@ export class AdminService {
         select: CLINIC_SELECT,
       });
 
-      // Same defaults the demo seed uses, so a hand-made clinic behaves like a
-      // seeded one: a normal and a special series, plus a clinic-default policy.
-      await tx.tokenSeries.createMany({
-        data: [
-          {
-            clinicId: clinic.id,
-            code: 'NORMAL_OP',
-            label: 'Normal OP',
-            prefix: 'N',
-            padWidth: 3,
-            startAt: 1,
-            resetPolicy: TokenResetPolicy.PER_SESSION,
-          },
-          {
-            clinicId: clinic.id,
-            code: 'SPECIAL_OP',
-            label: 'Special OP',
-            prefix: 'S',
-            padWidth: 3,
-            startAt: 101,
-            resetPolicy: TokenResetPolicy.PER_SESSION,
-          },
-        ],
-      });
-      await tx.queuePolicy.create({
-        data: {
-          clinicId: clinic.id,
-          doctorId: null,
-          mode: QueuePolicyMode.SHARED_FIFO,
-          ratio: { SPECIAL_OP: 2, NORMAL_OP: 1 },
-        },
-      });
+      // Same defaults the demo seed and the onboarding CLI use, so a hand-made
+      // clinic behaves like a seeded one.
+      await provisionClinicOpConfig(tx, clinic.id);
 
       return clinic;
     });

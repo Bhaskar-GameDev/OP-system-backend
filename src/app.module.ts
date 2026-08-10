@@ -27,6 +27,7 @@ import { NotificationsModule } from './notifications/notifications.module';
 import { ArchivalModule } from './archival/archival.module';
 import { DiscoveryModule } from './discovery/discovery.module';
 import { AdminModule } from './admin/admin.module';
+import { HospitalSetupModule } from './provisioning/hospital-setup.module';
 import { ReceptionModule } from './reception/reception.module';
 import { DoctorModule } from './doctor/doctor.module';
 import { ProfileModule } from './profile/profile.module';
@@ -67,6 +68,7 @@ import { HttpMetricsMiddleware } from './common/observability/http-metrics.middl
     ArchivalModule,
     DiscoveryModule,
     AdminModule,
+    HospitalSetupModule,
     ReceptionModule,
     DoctorModule,
     ProfileModule,
