@@ -43,15 +43,27 @@ services:
       redis:
         condition: service_healthy
     environment:
-      NODE_ENV: production
+      # This file is the local demo stack, and it ships no MSG91/Razorpay/FCM
+      # credentials on purpose. Under NODE_ENV=production the config gate in
+      # src/common/config/production-config.validator.ts refuses to boot without
+      # them — correctly, since their absence would silently enable the fake
+      # payment gateway and a universal OTP. Development is the honest label for
+      # what this stack is; docker-compose.prod.yml sets production explicitly.
+      NODE_ENV: development
       PORT: 3000
+      # DEMO.md documents `docker compose up -d --build` as producing a seeded,
+      # ready-to-click demo. The seed is idempotent and re-running is safe.
+      SEED_ON_START: "true"
       DATABASE_URL: postgresql://pfos:pfos_local_pw@postgres:5432/patient_flow_os?schema=public
       REDIS_HOST: redis
       REDIS_PORT: 6379
       JWT_SECRET: demo_only_change_me_in_production_0123456789
       OTP_EXPIRY_SECONDS: 300
       # Allow local desktop/web clients to call the containerised API.
-      CORS_ORIGINS: "http://localhost:1420,http://tauri.localhost,https://tauri.localhost,http://localhost:19006,http://localhost:8081"
+      # 1420 is the reception app's Vite port, 1430 the doctor app's. Both are
+      # needed to exercise the clients in a browser; the tauri.localhost entries
+      # cover them running as real desktop windows.
+      CORS_ORIGINS: "http://localhost:1420,http://localhost:1430,http://tauri.localhost,https://tauri.localhost,http://localhost:19006,http://localhost:8081"
       # Shared secret for the server-to-server /voice/* API. MUST match the voice
       # agent's VOICE_INTERNAL_SECRET (same variable name on both sides). The
       # guard fails closed: unset here means every /voice/* call 401s, so the
