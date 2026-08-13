@@ -2,6 +2,7 @@ import { Injectable, NotFoundException } from '@nestjs/common';
 import { SessionType } from '@prisma/client';
 import { PrismaService } from '../common/prisma/prisma.service';
 import { DAILY_SESSION_TYPE, END_OF_DAY } from '../common/session/daily-session';
+import { ymdLocal } from '../common/dates';
 
 /**
  * Same-day session resolution.
@@ -29,7 +30,6 @@ export interface ResolvedSession {
 export type TodaySession =
   | { status: 'OPEN'; session: ResolvedSession }
   | { status: 'NONE'; reason: 'NOT_SCHEDULED' | 'ENDED' };
-
 
 @Injectable()
 export class SessionResolverService {
@@ -94,9 +94,3 @@ function hm(d: Date): number {
   return d.getHours() * 60 + d.getMinutes();
 }
 
-function ymdLocal(d: Date): string {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
-}

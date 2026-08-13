@@ -9,6 +9,7 @@ import {
   ReportTotals,
   ReportTrendPoint,
 } from './reports.dto';
+import { ymd } from '../common/dates';
 
 /**
  * On-demand operational reporting. EVERY query is TENANT-scoped by a set of
@@ -287,9 +288,6 @@ export class ReportsService {
 }
 
 /** Date -> YYYY-MM-DD (UTC, matching how @db.Date round-trips). */
-function ymd(d: Date): string {
-  return d.toISOString().slice(0, 10);
-}
 
 function round1(n: number): number {
   return Math.round(n * 10) / 10;

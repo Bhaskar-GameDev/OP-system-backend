@@ -38,6 +38,7 @@ import {
   VoiceQueueStatusRecord,
   VoiceQueueStatusRequest,
 } from './voice.dto';
+import { todayYmdLocal, ymd } from '../common/dates';
 
 // Statuses a caller can still act on over the phone (token issued, in play).
 const LIVE_STATUSES: BookingStatus[] = [BookingStatus.BOOKED, BookingStatus.ACTIVE];
@@ -101,7 +102,7 @@ export class VoiceService {
     });
 
     const out: VoiceDoctorAvailability[] = [];
-    let sessionDate = todayYmd();
+    let sessionDate = todayYmdLocal();
 
     for (const d of doctors) {
       if (specialty && !(d.specialization ?? '').toLowerCase().includes(specialty)) continue;
@@ -609,10 +610,3 @@ export class VoiceService {
   }
 }
 
-function ymd(d: Date): string {
-  return d.toISOString().slice(0, 10);
-}
-function todayYmd(): string {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-}
