@@ -70,7 +70,15 @@ export interface VoiceAppointmentRecord {
 }
 
 // ── /voice/appointments/cancel ──
+/**
+ * `didNumber` + `patientPhone` are required for the same reason they are on
+ * lookup: the shared voice secret proves the request came from the voice agent,
+ * not that this caller is entitled to this booking. Without them the endpoint
+ * cancels any booking id at any clinic in the system.
+ */
 export interface VoiceCancelRequest {
+  didNumber: string;
+  patientPhone: string;
   appointmentId: string;
 }
 
