@@ -303,6 +303,14 @@ model Payment {
   razorpayRefundId String?       @map("razorpay_refund_id") // set on cancel/refund — audit trail
   createdAt        DateTime      @default(now()) @map("created_at")
 
+  // Desk settlement audit. Set when reception takes the money in person, so a
+  // waiver, a corporate bill and real cash are never the same "SUCCESS" row —
+  // and the collection can be traced to the staff member who took it. Null for
+  // ONLINE payments, where the gateway refs are the audit trail.
+  deskMode         OpPaymentMode? @map("desk_mode")
+  collectedById    String?        @map("collected_by_id") // staff id from the JWT
+  collectedAt      DateTime?      @map("collected_at")
+
   booking Booking?
 
   @@index([bookingId])

@@ -39,6 +39,7 @@ import {
   VoiceQueueStatusRequest,
 } from './voice.dto';
 import { todayYmdLocal, ymd } from '../common/dates';
+import { matchesSpecialty } from './specialty-match';
 
 // Statuses a caller can still act on over the phone (token issued, in play).
 const LIVE_STATUSES: BookingStatus[] = [BookingStatus.BOOKED, BookingStatus.ACTIVE];
@@ -105,7 +106,10 @@ export class VoiceService {
     let sessionDate = todayYmdLocal();
 
     for (const d of doctors) {
-      if (specialty && !(d.specialization ?? '').toLowerCase().includes(specialty)) continue;
+      // Alias + fuzzy match: callers say "చర్మ వైద్యం" or STT hands us "థర్మాటోలజీ",
+      // and one seeded specialization is typo'd ("dermatolgy"). A substring test
+      // rejected all of those and told the caller the specialty was unavailable.
+      if (!matchesSpecialty(d.specialization, specialty)) continue;
 
       // Per-doctor isolation: this loop touches the session resolver, Redis and
       // the config engine once per doctor. One doctor with a broken schedule (or

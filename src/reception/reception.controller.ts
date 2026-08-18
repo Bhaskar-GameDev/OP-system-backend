@@ -16,7 +16,13 @@ import { RolesGuard } from '../auth/roles.guard';
 import { Roles } from '../auth/roles.decorator';
 import { ReceptionService } from './reception.service';
 import { DAILY_SESSION_TYPE } from '../common/session/daily-session';
-import { CheckInInput, RegisterWalkInInput } from './reception.dto';
+import {
+  CheckInInput,
+  CollectPaymentInput,
+  DESK_PAYMENT_MODES,
+  DeskPaymentMode,
+  RegisterWalkInInput,
+} from './reception.dto';
 
 /**
  * Reception desk endpoints. STAFF/ADMIN only, scoped to the caller's own clinic
@@ -101,12 +107,38 @@ export class ReceptionController {
   }
 
   /**
-   * POST /reception/bookings/:id/collect-payment — settle a pay-at-desk (voice)
-   * booking's payment in cash/UPI at the desk. Flips the Payment to SUCCESS.
+   * POST /reception/bookings/:id/collect-payment — settle a pay-at-desk booking
+   * (voice OR walk-in) at the counter.
+   * body: { mode?: 'CASH'|'UPI_DESK'|'CORPORATE_BILL'|'WAIVED', amountPaise?: number }
+   *
+   * Body is optional: no body = CASH at the full amount due, which is what older
+   * reception builds send. The staff id from the JWT is recorded as the actor —
+   * a collection can always be traced to the person who took the money.
    */
   @Post('bookings/:id/collect-payment')
-  collectPayment(@Req() req: AuthedRequest, @Param('id') id: string) {
-    return this.reception.collectPayment(clinicId(req), id);
+  collectPayment(
+    @Req() req: AuthedRequest,
+    @Param('id') id: string,
+    @Body() body: CollectPaymentInput | undefined,
+  ) {
+    const mode = body?.mode;
+    if (mode !== undefined && !DESK_PAYMENT_MODES.includes(mode)) {
+      throw new BadRequestException(
+        `mode must be one of ${DESK_PAYMENT_MODES.join(', ')}`,
+      );
+    }
+    const amountPaise = body?.amountPaise;
+    if (
+      amountPaise !== undefined &&
+      (!Number.isInteger(amountPaise) || amountPaise < 0)
+    ) {
+      throw new BadRequestException('amountPaise must be a non-negative integer');
+    }
+    return this.reception.collectPayment(clinicId(req), id, {
+      mode: mode as DeskPaymentMode | undefined,
+      amountPaise,
+      actorId: req.user?.sub,
+    });
   }
 }
 

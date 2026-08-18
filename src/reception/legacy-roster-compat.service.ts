@@ -45,7 +45,13 @@ export class LegacyRosterCompatService {
     const day = new Date(`${session.sessionDate.slice(0, 10)}T00:00:00.000Z`);
     const encounters = await this.prisma.encounter.findMany({
       where: { doctorId: session.doctorId, serviceDate: day },
-      select: { id: true, status: true, legacyBookingId: true, patientId: true },
+      select: {
+        id: true,
+        status: true,
+        legacyBookingId: true,
+        patientId: true,
+        opCategoryId: true,
+      },
     });
     if (encounters.length === 0) return [];
 
@@ -55,14 +61,37 @@ export class LegacyRosterCompatService {
       this.prisma.checkIn.findMany({ where: { encounterId: { in: ids } }, select: { encounterId: true, checkedInAt: true } }),
       this.prisma.registration.findMany({ where: { encounterId: { in: ids } }, select: { encounterId: true, source: true } }),
       this.prisma.patient.findMany({ where: { id: { in: encounters.map((e) => e.patientId) } }, select: { id: true, name: true } }),
-      this.prisma.opPayment.findMany({ where: { encounterId: { in: ids } }, select: { encounterId: true, status: true, mode: true } }),
+      this.prisma.opPayment.findMany({ where: { encounterId: { in: ids } }, select: { encounterId: true, status: true, mode: true, amount: true } }),
     ]);
+
+    // What each encounter's token series charges — the amount the desk asks for
+    // before anything has been settled. Without it every unpaid row reads "₹0".
+    const series = await this.prisma.tokenSeries.findMany({
+      where: { id: { in: [...new Set(encounters.map((e) => e.opCategoryId))] } },
+      select: { id: true, fee: true },
+    });
+    const seriesFeeBy = new Map(series.map((t) => [t.id, t.fee]));
+
+    // A series with no fee configured is the common case on a freshly cut-over
+    // clinic, and "due ₹0" at the counter is worse than useless — the desk would
+    // collect nothing and record it as settled. Fall back to the doctor's own
+    // consultation fee, which is what reception has always charged.
+    const doctor = await this.prisma.doctor.findUnique({
+      where: { id: session.doctorId },
+      select: { consultationFee: true },
+    });
+    const doctorFeePaise = (doctor?.consultationFee ?? 0) * 100;
+    const feeFor = (opCategoryId: string): number =>
+      seriesFeeBy.get(opCategoryId) || doctorFeePaise;
 
     const tokenBy = new Map(tokens.map((t) => [t.encounterId, t.displayNumber]));
     const checkInBy = new Map(checkIns.map((c) => [c.encounterId, c.checkedInAt]));
     const sourceBy = new Map(regs.map((r) => [r.encounterId, r.source]));
     const nameBy = new Map(patients.map((p) => [p.id, p.name]));
-    const paysBy = new Map<string, { status: PaymentStatus; mode: OpPaymentMode }[]>();
+    const paysBy = new Map<
+      string,
+      { status: PaymentStatus; mode: OpPaymentMode; amount: number }[]
+    >();
     for (const p of payments) {
       (paysBy.get(p.encounterId) ?? paysBy.set(p.encounterId, []).get(p.encounterId)!).push(p);
     }
@@ -75,6 +104,7 @@ export class LegacyRosterCompatService {
       const source = sourceBy.get(e.id);
       const checkedInAt = checkInBy.get(e.id) ?? null;
       const pays = paysBy.get(e.id) ?? [];
+      const settled = pays.find((p) => p.status === PaymentStatus.SUCCESS);
       rows.push({
         bookingId: e.legacyBookingId ?? e.id, // real bookingId if migrated, else encounterId
         tokenNumber,
@@ -83,8 +113,15 @@ export class LegacyRosterCompatService {
         status: mapStatus(e.status),
         arrived: checkedInAt !== null,
         checkedInAt: checkedInAt ? checkedInAt.toISOString() : null,
-        payAtDesk: source === RegistrationSource.VOICE_AGENT || pays.some((p) => p.mode !== OpPaymentMode.ONLINE),
-        paid: pays.some((p) => p.status === PaymentStatus.SUCCESS),
+        // Money is owed at the desk unless it already came in ONLINE. Walk-ins
+        // and voice both land here; an app patient who paid in the app does not,
+        // so the desk is never offered a button to re-collect what is settled.
+        payAtDesk: !pays.some(
+          (p) => p.mode === OpPaymentMode.ONLINE && p.status === PaymentStatus.SUCCESS,
+        ),
+        paid: settled !== undefined,
+        amountDuePaise: settled?.amount ?? feeFor(e.opCategoryId),
+        paidMode: settled?.mode ?? null,
       });
     }
     // token order, like the legacy roster

@@ -37,10 +37,15 @@ export interface BookingRosterView {
   status: string;
   arrived: boolean;
   checkedInAt: string | null; // ISO8601, or null if not arrived
-  // Payment settle state — relevant to voice "pay-at-desk" tokens the desk
-  // collects on arrival. paid = an attached Payment at status SUCCESS.
+  // Payment settle state — relevant to every "pay-at-desk" token (voice AND
+  // walk-in) the desk collects on arrival. paid = an attached Payment at status
+  // SUCCESS. amountDuePaise is what the desk should ask for (or, once paid, what
+  // was actually taken); paidMode names HOW it was settled, so a cash drawer and
+  // a waiver are never indistinguishable on the roster.
   payAtDesk: boolean;
   paid: boolean;
+  amountDuePaise: number;
+  paidMode: string | null; // CASH | UPI_DESK | CORPORATE_BILL | WAIVED | ONLINE
 }
 
 type RosterRow = {
@@ -50,7 +55,7 @@ type RosterRow = {
   status: string;
   checkedInAt: Date | null;
   payAtDesk: boolean;
-  payment: { status: string } | null;
+  payment: { status: string; amount: number; deskMode: string | null } | null;
   patient: { name: string };
 };
 
@@ -65,7 +70,38 @@ export function toBookingRosterView(b: RosterRow): BookingRosterView {
     checkedInAt: b.checkedInAt ? b.checkedInAt.toISOString() : null,
     payAtDesk: b.payAtDesk,
     paid: b.payment?.status === 'SUCCESS',
+    amountDuePaise: b.payment?.amount ?? 0,
+    paidMode: b.payment?.status === 'SUCCESS' ? b.payment.deskMode : null,
   };
+}
+
+/**
+ * How the desk settled: the OpPaymentMode subset reception can take in person.
+ * ONLINE is deliberately absent — that is the app's Razorpay path, never a desk
+ * action, so it cannot be claimed by a click at the counter.
+ */
+export type DeskPaymentMode =
+  | 'CASH'
+  | 'UPI_DESK'
+  | 'CORPORATE_BILL'
+  | 'WAIVED';
+
+export const DESK_PAYMENT_MODES: DeskPaymentMode[] = [
+  'CASH',
+  'UPI_DESK',
+  'CORPORATE_BILL',
+  'WAIVED',
+];
+
+/**
+ * Desk collection body. Both fields optional so older reception clients (which
+ * post an empty body) keep working — they settle CASH at the full amount due,
+ * exactly the old behaviour. amountPaise covers concessions/part payment; WAIVED
+ * always settles 0 whatever is sent.
+ */
+export interface CollectPaymentInput {
+  mode?: DeskPaymentMode;
+  amountPaise?: number;
 }
 
 /** Result of a desk payment collection. */
@@ -73,6 +109,7 @@ export interface CollectPaymentView {
   bookingId: string;
   paid: boolean;
   amountPaise: number;
+  mode: DeskPaymentMode;
 }
 
 /**

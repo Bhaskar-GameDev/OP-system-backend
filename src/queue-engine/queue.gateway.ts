@@ -25,7 +25,8 @@ import { MetricsService } from '../common/observability/metrics.service';
 import { WsExceptionsFilter } from '../common/errors/ws-exceptions.filter';
 import { DisplayService } from '../display/display.service';
 import { QueueReadService } from '../read-side/queue-read.service';
-import { EtaService } from './eta.service';
+import { ReceptionQueueCompatService } from '../reception/reception-queue-compat.service';
+import { EtaResult, EtaService } from './eta.service';
 import { QueueService } from './queue.service';
 import { QueueEventsService } from './queue-events.service';
 import { SessionKey } from './token.service';
@@ -105,6 +106,7 @@ export class QueueGateway
     private readonly tenant: TenantService,
     private readonly display: DisplayService,
     private readonly reads: QueueReadService,
+    private readonly deskQueue: ReceptionQueueCompatService,
   ) {}
 
   onModuleInit(): void {
@@ -326,7 +328,7 @@ export class QueueGateway
       return;
     }
     await client.join(sessionRoom(session));
-    const queue = await this.eta.etaForQueue(session);
+    const queue = await this.deskQueueOrLegacy(session);
     client.emit('snapshot', { kind: 'session', session, queue });
   }
 
@@ -355,6 +357,19 @@ export class QueueGateway
     return false;
   }
 
+  /**
+   * The desk's queue, from the OP projection when the clinic is flipped and from
+   * the legacy ZSET otherwise. Same `EtaResult[]` either way, so both the join
+   * snapshot and every broadcast agree on one source — a mismatch there would show
+   * the desk a token on connect that vanished on the next update.
+   */
+  private async deskQueueOrLegacy(session: SessionKey): Promise<EtaResult[]> {
+    if (await this.deskQueue.enabled(session.doctorId)) {
+      return this.deskQueue.queue(session);
+    }
+    return this.eta.etaForQueue(session);
+  }
+
   // ── fan-out on state change ──────────────────────────────
   private async broadcast(session: SessionKey): Promise<void> {
     // No socket server in a context-only process (CLI scripts, workers): those
@@ -363,7 +378,7 @@ export class QueueGateway
     // unguarded call surfaces as an unhandled rejection that kills the process.
     if (!this.server) return;
 
-    const queue = await this.eta.etaForQueue(session);
+    const queue = await this.deskQueueOrLegacy(session);
 
     // full state to the session room (staff)
     this.server.to(sessionRoom(session)).emit('queue:update', { session, queue });
