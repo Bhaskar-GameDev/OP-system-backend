@@ -44,8 +44,13 @@ export class VoiceController {
 
   @Post('appointments/cancel')
   cancel(@Body() body: VoiceCancelRequest) {
-    if (!body?.appointmentId) throw new BadRequestException('appointmentId is required');
-    return this.voice.cancel(body.appointmentId);
+    // didNumber + patientPhone are mandatory here, exactly as on lookup: they
+    // are what scopes the cancellation to the dialed clinic and the calling
+    // patient. See VoiceService.cancel().
+    if (!body?.didNumber || !body?.patientPhone || !body?.appointmentId) {
+      throw new BadRequestException('didNumber, patientPhone and appointmentId are required');
+    }
+    return this.voice.cancel(body);
   }
 
   /**

@@ -294,7 +294,11 @@ describe('Voice API (/voice) — real infra', () => {
     const lookup = (await (await voice('/voice/appointments/lookup', { didNumber: DID, patientPhone: PHONE })).json()) as Array<{ appointmentId: string }>;
     const bookingId = lookup[0].appointmentId;
 
-    const res = await voice('/voice/appointments/cancel', { appointmentId: bookingId });
+    const res = await voice('/voice/appointments/cancel', {
+      didNumber: DID,
+      patientPhone: PHONE,
+      appointmentId: bookingId,
+    });
     expect(res.status).toBe(201);
     const rec = (await res.json()) as { status: string };
     expect(rec.status).toBe('CANCELLED');
@@ -322,6 +326,50 @@ describe('Voice API (/voice) — real infra', () => {
 
     // legacy queue never held the voice token — the filler walk-in is untouched
     expect(await queue.size(session)).toBe(1);
+  });
+
+  /**
+   * The voice secret proves the request came from the agent process, not that
+   * the caller is entitled to the booking. Before this was enforced, a bare
+   * appointmentId cancelled ANY booking at ANY clinic — including refunding it.
+   * Both halves of the scope are pinned here: the dialed clinic, and the
+   * calling number. A booking outside either must read as not-found, so the
+   * response cannot be used to probe which ids exist.
+   */
+  it('cancel refuses a booking outside the dialed clinic / calling number', async () => {
+    // Books its own target rather than reusing one: the cancel test above
+    // leaves no BOOKED row behind, and this test must end with the booking
+    // still BOOKED to prove nothing was cancelled.
+    const created = await voice('/voice/bookings', {
+      didNumber: DID, doctorId: DOCTOR, sessionType: 'MORNING',
+      patientPhone: PHONE, patientName: 'Voice Caller', callSid: 'call-scope',
+    });
+    expect(created.status).toBe(201);
+    const booking = (await created.json()) as { bookingId: string };
+
+    // right clinic, wrong caller
+    const wrongCaller = await voice('/voice/appointments/cancel', {
+      didNumber: DID,
+      patientPhone: '9399999999',
+      appointmentId: booking.id,
+    });
+    expect(wrongCaller.status).toBe(404);
+
+    // right caller, a DID that is not this booking's clinic
+    const otherDid = await voice('/voice/appointments/cancel', {
+      didNumber: '+919999999999',
+      patientPhone: PHONE,
+      appointmentId: booking.id,
+    });
+    expect(otherDid.status).toBe(404);
+
+    // scope is mandatory: an id on its own is rejected outright
+    const noScope = await voice('/voice/appointments/cancel', { appointmentId: booking.id });
+    expect(noScope.status).toBe(400);
+
+    // and the booking is untouched by any of the three
+    const row = await prisma.booking.findUniqueOrThrow({ where: { id: booking.id } });
+    expect(row.status).toBe(BookingStatus.BOOKED);
   });
 
   it('call-logs persists idempotently by callSid', async () => {

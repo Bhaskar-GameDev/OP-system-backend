@@ -149,8 +149,14 @@ export class PaymentsService {
   /**
    * Razorpay webhook. Verifies the signature on the RAW body first (spoofed /
    * unsigned -> 401), then dispatches by event:
-   *  - payment.failed -> expire the booking + release any token (idempotent)
-   *  - otherwise (payment.captured / authorized) -> confirm (idempotent)
+   *  - payment.failed    -> expire the booking + release any token (idempotent)
+   *  - payment.captured  -> confirm (idempotent)
+   *  - anything else      -> acknowledged and ignored
+   *
+   * Only `captured` confirms. `authorized` is mid-flight: the money is held but
+   * not taken, and capture normally lands seconds later. Routing it into
+   * confirm() closed the payment as not-captured, which the later capture event
+   * could no longer undo — the patient paid and never got a token.
    */
   async handleWebhook(rawBody: string, signature: string): Promise<void> {
     if (!this.razorpay.verifyWebhookSignature(rawBody, signature)) {
@@ -167,7 +173,23 @@ export class PaymentsService {
       await this.handlePaymentFailed(entity.order_id, entity.id ?? null);
       return;
     }
+    if (event.event !== 'payment.captured') return;
     if (!entity.id) return;
+
+    // Razorpay webhooks are account-wide, so orders this table never created
+    // (the OP payment flow keeps its own rows) arrive here too. confirm()
+    // answers 404 for those, and a sustained run of non-2xx responses makes
+    // Razorpay disable the endpoint — for every order, not just the unknown
+    // ones. An unknown order is logged and acknowledged instead.
+    const known = await this.prisma.payment.findUnique({
+      where: { razorpayOrderId: entity.order_id },
+      select: { id: true },
+    });
+    if (!known) {
+      this.logger.warn(`payment.captured for unknown order ${entity.order_id} — ignored`);
+      return;
+    }
+
     await this.confirm(entity.order_id, entity.id);
   }
 
@@ -225,6 +247,23 @@ export class PaymentsService {
 
     let expired = 0;
     for (const booking of stale) {
+      // Never expire a booking whose money was actually taken. The confirm path
+      // flips the payment to SUCCESS before it flips the booking to BOOKED, so
+      // a booking can legitimately sit in PENDING_PAYMENT for a moment with a
+      // settled payment behind it. Expiring one of those would release the
+      // token and push "payment failed" for a patient who has already paid.
+      if (
+        booking.payment &&
+        booking.payment.status !== PaymentStatus.CREATED &&
+        booking.payment.status !== PaymentStatus.FAILED
+      ) {
+        this.logger.warn(
+          `booking ${booking.id} is pending past the cutoff but its payment is ` +
+            `${booking.payment.status} — left alone for reconciliation`,
+        );
+        continue;
+      }
+
       // guarded transition — skip if a confirm flipped it since the read
       const flipped = await this.prisma.booking.updateMany({
         where: { id: booking.id, status: BookingStatus.PENDING_PAYMENT },
@@ -310,6 +349,22 @@ export class PaymentsService {
 
     // already confirmed by either path -> idempotent no-op
     if (payment.status === PaymentStatus.SUCCESS) {
+      // ...unless the money was taken but no token came out of it. The flip to
+      // SUCCESS commits before issuance, so a crash or a Redis outage in
+      // between leaves a paid booking with `tokenNumber` null, and every later
+      // retry used to return an empty token forever. Resume the remaining
+      // steps instead — each one is idempotent and re-entrant.
+      if (
+        !payment.booking.tokenNumber &&
+        (payment.booking.status === BookingStatus.PENDING_PAYMENT ||
+          payment.booking.status === BookingStatus.BOOKED)
+      ) {
+        this.logger.warn(
+          `order ${orderId} was paid but has no token — resuming issuance`,
+        );
+        const tokenNumber = await this.issueToken(payment.booking);
+        return { bookingId: payment.booking.id, tokenNumber, alreadyProcessed: false };
+      }
       return {
         bookingId: payment.booking.id,
         tokenNumber: payment.booking.tokenNumber ?? '',
@@ -323,11 +378,17 @@ export class PaymentsService {
       throw new BadRequestException('payment does not match order');
     }
     if (rp.status !== 'captured') {
-      // not a success: leave booking PENDING; record the failure, no token
-      await this.prisma.payment.updateMany({
-        where: { id: payment.id, status: PaymentStatus.CREATED },
-        data: { status: PaymentStatus.FAILED, razorpayPaymentId: paymentId },
-      });
+      // Only a TERMINAL gateway failure may close the payment. `created` and
+      // `authorized` are mid-flight — capture can still land — and FAILED is a
+      // terminal state here, so recording it for those would permanently block
+      // the confirmation that follows: the later captured event would find no
+      // CREATED row to flip and the money would be taken with no token issued.
+      if (rp.status === 'failed') {
+        await this.prisma.payment.updateMany({
+          where: { id: payment.id, status: PaymentStatus.CREATED },
+          data: { status: PaymentStatus.FAILED, razorpayPaymentId: paymentId },
+        });
+      }
       throw new ConflictException(`payment not captured (status: ${rp.status})`);
     }
 
@@ -353,7 +414,29 @@ export class PaymentsService {
     }
 
     // WE won: issue the token via the existing Queue Engine path
-    const booking = payment.booking;
+    const tokenNumber = await this.issueToken(payment.booking);
+    return { bookingId: payment.booking.id, tokenNumber, alreadyProcessed: false };
+  }
+
+  /**
+   * Everything that turns a paid booking into a queued one: BOOKED, a queue
+   * token, the confirmation push, and the dual-write to the new engine.
+   *
+   * Separate from confirm() because it has two callers — the path that wins the
+   * CREATED -> SUCCESS flip, and the resume path for a booking whose payment
+   * already succeeded but whose issuance did not finish. Every step is
+   * idempotent (enqueueBooking dedups on the booking id, the push is gated in
+   * Redis, the mirror keys on the booking id), so re-entering it after a
+   * partial failure repeats work rather than duplicating it.
+   */
+  private async issueToken(booking: {
+    id: string;
+    doctorId: string;
+    patientId: string;
+    sessionDate: Date;
+    sessionType: string;
+    source: BookingSource;
+  }): Promise<string> {
     await this.prisma.booking.update({
       where: { id: booking.id },
       data: { status: BookingStatus.BOOKED }, // must be BOOKED before enqueue (promote guard)
@@ -386,11 +469,7 @@ export class PaymentsService {
       legacyBookingId: booking.id,
     });
 
-    return {
-      bookingId: booking.id,
-      tokenNumber: entry.tokenNumber,
-      alreadyProcessed: false,
-    };
+    return entry.tokenNumber;
   }
 
   /**
@@ -452,18 +531,30 @@ export class PaymentsService {
     let refundStatus: string | null = null;
     const payment = booking.payment;
     if (payment?.status === PaymentStatus.SUCCESS && payment.razorpayPaymentId) {
-      const refund = await this.razorpay.refund(payment.razorpayPaymentId);
-      refundId = refund.refundId;
-      refundStatus = refund.status;
-      refunded = true;
+      // The booking is already CANCELLED at this point, so letting a gateway
+      // error escape would strand it: the money stays captured, refundStatus is
+      // never written, and no retry is possible because a CANCELLED booking is
+      // rejected by the guard above. Record the failure instead and leave the
+      // payment SUCCESS so `retryRefund` can pick it up.
+      try {
+        const refund = await this.razorpay.refund(payment.razorpayPaymentId);
+        refundId = refund.refundId;
+        refundStatus = refund.status;
+        refunded = true;
 
-      // processed/pending -> money is on its way back: retain the payment row,
-      // flip to REFUNDED with the ref. failed -> leave it SUCCESS for retry.
-      if (refund.status !== 'failed') {
-        await this.prisma.payment.update({
-          where: { id: payment.id },
-          data: { status: PaymentStatus.REFUNDED, razorpayRefundId: refundId },
-        });
+        // processed/pending -> money is on its way back: retain the payment row,
+        // flip to REFUNDED with the ref. failed -> leave it SUCCESS for retry.
+        if (refund.status !== 'failed') {
+          await this.prisma.payment.update({
+            where: { id: payment.id },
+            data: { status: PaymentStatus.REFUNDED, razorpayRefundId: refundId },
+          });
+        }
+      } catch (err) {
+        refundStatus = 'failed';
+        this.logger.error(
+          `refund failed for booking ${bookingId}: ${(err as Error).message}`,
+        );
       }
     }
 
@@ -472,6 +563,61 @@ export class PaymentsService {
       data: { refundStatus },
     });
 
+    // Sent from here rather than from each caller: cancellation reaches this
+    // method from three entry points (the patient/staff booking action, the
+    // /payments/cancel route and the voice bridge), and only one of them used
+    // to notify — so a patient cancelled at the desk or by phone was never told
+    // their booking, or their refund, had gone through. Idempotent by the same
+    // Redis gate as every other push, so callers cannot double-send it.
+    await this.notifications.bookingCancelled(bookingId, refundStatus);
+
     return { refunded, refundStatus, refundId };
+  }
+
+  /**
+   * Re-attempt the refund for an already-cancelled booking whose money is still
+   * captured — the gateway was down, or Razorpay returned `failed`.
+   *
+   * cancelBooking() cannot do this itself: it rejects a CANCELLED booking by
+   * design, so without a second entry point a failed refund had no way back and
+   * the patient's money sat with the gateway indefinitely. Safe to call
+   * repeatedly — a payment already REFUNDED reports that and does nothing.
+   */
+  async retryRefund(
+    bookingId: string,
+  ): Promise<{ refunded: boolean; refundStatus: string | null; refundId: string | null }> {
+    const booking = await this.prisma.booking.findUnique({
+      where: { id: bookingId },
+      include: { payment: true },
+    });
+    if (!booking) throw new NotFoundException('booking not found');
+    if (booking.status !== BookingStatus.CANCELLED) {
+      throw new ConflictException(`booking is ${booking.status}, not CANCELLED`);
+    }
+
+    const payment = booking.payment;
+    if (!payment || !payment.razorpayPaymentId) {
+      throw new ConflictException('booking has no captured payment to refund');
+    }
+    if (payment.status === PaymentStatus.REFUNDED) {
+      return { refunded: true, refundStatus: booking.refundStatus, refundId: payment.razorpayRefundId };
+    }
+    if (payment.status !== PaymentStatus.SUCCESS) {
+      throw new ConflictException(`payment is ${payment.status}, nothing to refund`);
+    }
+
+    const refund = await this.razorpay.refund(payment.razorpayPaymentId);
+    if (refund.status !== 'failed') {
+      await this.prisma.payment.update({
+        where: { id: payment.id },
+        data: { status: PaymentStatus.REFUNDED, razorpayRefundId: refund.refundId },
+      });
+    }
+    await this.prisma.booking.update({
+      where: { id: bookingId },
+      data: { refundStatus: refund.status },
+    });
+
+    return { refunded: true, refundStatus: refund.status, refundId: refund.refundId };
   }
 }

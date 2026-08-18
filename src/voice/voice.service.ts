@@ -33,6 +33,7 @@ import {
   VoiceBookingRequest,
   VoiceBookingResult,
   VoiceCallLogRequest,
+  VoiceCancelRequest,
   VoiceDoctorAvailability,
   VoiceLookupRequest,
   VoiceQueueStatusRecord,
@@ -500,9 +501,34 @@ export class VoiceService {
   }
 
   // ── cancel ────────────────────────────────────────────────────────────────
-  async cancel(appointmentId: string): Promise<VoiceAppointmentRecord> {
-    const booking = await this.prisma.booking.findUnique({
-      where: { id: appointmentId },
+  /**
+   * Cancel one of the caller's own bookings at the clinic they dialed.
+   *
+   * The booking is looked up under the SAME scope as lookup()/queueStatus():
+   * the clinic behind the DID, and the patient behind the calling number. The
+   * VoiceSecretGuard on this route authenticates the voice-agent process, not
+   * the caller — it says "this request came from our agent", never "this caller
+   * owns this booking". Taking a bare appointmentId therefore let any call, on
+   * any clinic's line, cancel any booking in the system (and trigger its
+   * refund) given only its id.
+   *
+   * A booking that exists but fails the scope is reported as not-found, so the
+   * response cannot be used to probe which ids are real.
+   */
+  async cancel(req: VoiceCancelRequest): Promise<VoiceAppointmentRecord> {
+    const clinic = await this.clinicForDid(req.didNumber);
+    const patient = await this.prisma.patient.findUnique({
+      where: { mobile: req.patientPhone },
+      select: { id: true },
+    });
+    if (!patient) throw new NotFoundException('appointment not found');
+
+    const booking = await this.prisma.booking.findFirst({
+      where: {
+        id: req.appointmentId,
+        patientId: patient.id,
+        doctor: { clinicId: clinic.id },
+      },
       select: {
         id: true, doctorId: true, tokenNumber: true, sessionDate: true, sessionType: true,
         doctor: { select: { name: true, specialization: true, clinicId: true } },
@@ -510,6 +536,7 @@ export class VoiceService {
       },
     });
     if (!booking) throw new NotFoundException('appointment not found');
+    const appointmentId = booking.id;
 
     // Race-safe status flip + queue removal + refund-if-paid (pay-at-desk has no
     // captured payment, so this just cancels). Status gate is inside cancelBooking.

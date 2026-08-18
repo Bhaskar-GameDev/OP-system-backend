@@ -333,6 +333,14 @@ export class NotificationsService implements OnModuleInit, OnModuleDestroy {
       this.logger.error(
         `${type} push failed for ${logToken}: ${(err as Error).message}`,
       );
+      if (!STALE_TOKEN_CODES.has(code)) {
+        // A transient failure (FCM 5xx, network) must not consume the one
+        // delivery this gate allows — the patient would silently never be told
+        // it is their turn. Un-gate so the next queue mutation retries, the
+        // same way the no-device case above does. A stale token is deliberately
+        // left gated: re-sending to a dead token cannot succeed.
+        await this.redisService.redis.srem(key, member);
+      }
       if (STALE_TOKEN_CODES.has(code) && patientId) {
         await this.prisma.patient
           .updateMany({

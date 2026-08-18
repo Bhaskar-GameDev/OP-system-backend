@@ -74,7 +74,8 @@ export class BookingActionsService {
       metadata: { reason: reason ?? null, refundStatus: res.refundStatus },
     });
 
-    await this.notifications.bookingCancelled(bookingId, res.refundStatus);
+    // The cancellation push is sent by PaymentsService.cancelBooking above, so
+    // that every cancel path emits it — not only this one.
 
     return { status: 'CANCELLED', refunded: res.refunded, refundStatus: res.refundStatus };
   }
