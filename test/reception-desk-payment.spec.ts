@@ -1,7 +1,7 @@
 import { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { AddressInfo } from 'node:net';
-import { OpPaymentMode, PaymentStatus } from '@prisma/client';
+import { OpPaymentMode, PaymentStatus, TokenResetPolicy } from '@prisma/client';
 import { AppModule } from '../src/app.module';
 import { PrismaService } from '../src/common/prisma/prisma.service';
 import { AuthTokenService } from '../src/auth/auth-token.service';
@@ -31,6 +31,7 @@ describe('Reception desk payment collection (full stack)', () => {
   const CLINIC = 'dp-clinic';
   const DOCTOR = 'dp-doc';
   const STAFF = 'dp-staff-1';
+  const SERIES = 'dp-series';
   const FEE_RUPEES = 350;
   const FEE_PAISE = FEE_RUPEES * 100;
   const MOBILES = [
@@ -70,6 +71,21 @@ describe('Reception desk payment collection (full stack)', () => {
         avgConsultMinutes: 10,
       },
     });
+    // A token series makes the OP mirror actually run for this clinic — without
+    // one it skips (best effort) and no encounter exists to flip the roster to.
+    // fee stays 0 on purpose: the desk amount must come from the doctor's fee.
+    await prisma.tokenSeries.create({
+      data: {
+        id: SERIES,
+        clinicId: CLINIC,
+        code: 'NORMAL_OP',
+        label: 'Normal',
+        prefix: 'N',
+        padWidth: 3,
+        startAt: 1,
+        resetPolicy: TokenResetPolicy.PER_SESSION,
+      },
+    });
     staffToken = tokens.sign({ sub: STAFF, role: 'STAFF', clinicId: CLINIC });
   });
 
@@ -100,6 +116,13 @@ describe('Reception desk payment collection (full stack)', () => {
       await prisma.registration.deleteMany({ where: { encounterId: { in: encIds } } });
       await prisma.encounter.deleteMany({ where: { id: { in: encIds } } });
     }
+    for (const sess of await prisma.opSession
+      .findMany({ where: { doctorId: DOCTOR }, select: { id: true } })
+      .catch(() => [])) {
+      await prisma.queueEntry.deleteMany({ where: { opSessionId: sess.id } }).catch(() => {});
+    }
+    await prisma.opSession.deleteMany({ where: { doctorId: DOCTOR } }).catch(() => {});
+    await prisma.tokenSeries.deleteMany({ where: { clinicId: CLINIC } });
     await prisma.patient.deleteMany({ where: { mobile: { in: MOBILES } } });
     await prisma.doctor.deleteMany({ where: { id: DOCTOR } });
     await prisma.clinic.deleteMany({ where: { id: CLINIC } });
