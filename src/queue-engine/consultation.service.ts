@@ -15,18 +15,12 @@ import {
   tokenCounterKey,
   tokenPrefix,
 } from './token.service';
-
-const LOCK_TTL_MS = 5000;
-const LOCK_RETRY_MS = 15;
-const LOCK_WAIT_MS = 5000;
-
-/** Release lock only if we still own it (compare-and-delete). */
-const UNLOCK_LUA = `
-if redis.call('GET', KEYS[1]) == ARGV[1] then
-  return redis.call('DEL', KEYS[1])
-end
-return 0
-`;
+import {
+  LOCK_TTL_MS,
+  LOCK_RETRY_MS,
+  LOCK_WAIT_MS,
+  UNLOCK_LUA,
+} from './session-lock';
 
 export interface DoneResult {
   doneToken: string;

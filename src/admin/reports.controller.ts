@@ -16,6 +16,7 @@ import { TenantService } from '../common/tenant/tenant.service';
 import { ReportsService } from './reports.service';
 import { ReportBucket } from './reports.dto';
 import { toCsv } from '../common/csv';
+import { ymd } from '../common/dates';
 
 /**
  * Operational reporting surface. ADMIN sees their whole HOSPITAL (every clinic
@@ -114,10 +115,6 @@ function parseBucket(b: string | undefined): ReportBucket {
   if (b === undefined || b === '') return 'day';
   if (b === 'day' || b === 'week' || b === 'month') return b;
   throw new BadRequestException('bucket must be day, week or month');
-}
-
-function ymd(d: Date): string {
-  return d.toISOString().slice(0, 10);
 }
 
 function iso(d: Date | null): string {

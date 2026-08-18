@@ -4,6 +4,7 @@ import { PrismaService } from '../common/prisma/prisma.service';
 import { SessionResolverService } from '../bookings/session-resolver.service';
 import { QueueService } from '../queue-engine/queue.service';
 import { SessionKey } from '../queue-engine/token.service';
+import { ymdLocal } from '../common/dates';
 
 /**
  * How many recently-completed tokens each card carries. Enough for a patient who
@@ -242,9 +243,3 @@ export class DisplayService {
   }
 }
 
-function ymdLocal(d: Date): string {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
-}

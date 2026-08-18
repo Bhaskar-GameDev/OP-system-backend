@@ -45,8 +45,19 @@ export class ArchivalService {
   /** Daily sweep. Runs off the active request path entirely. */
   @Cron(CronExpression.EVERY_DAY_AT_2AM, { name: 'booking-archival' })
   async scheduledSweep(): Promise<void> {
-    const { archived } = await this.runSweep();
-    if (archived > 0) this.logger.log(`archived ${archived} settled booking(s)`);
+    // Same reasoning as AnalyticsService.scheduledSummary: a scheduled job has
+    // no caller, so an escaping error is an unhandled rejection naming nothing.
+    // Each booking moves in its own transaction, so a mid-sweep failure leaves
+    // the already-moved ones consistent and the rest for tomorrow's run.
+    try {
+      const { archived } = await this.runSweep();
+      if (archived > 0) this.logger.log(`archived ${archived} settled booking(s)`);
+    } catch (err) {
+      this.logger.error(
+        `archival sweep failed: ${err instanceof Error ? err.message : String(err)}`,
+        err instanceof Error ? err.stack : undefined,
+      );
+    }
   }
 
   /**

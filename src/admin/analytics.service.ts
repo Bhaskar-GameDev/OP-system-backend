@@ -41,8 +41,20 @@ export class AnalyticsService {
   /** 2:30am — after the 2am archival sweep has populated booking_history. */
   @Cron('30 2 * * *', { name: 'daily-summary' })
   async scheduledSummary(): Promise<void> {
-    const { clinics } = await this.runDailySummary();
-    if (clinics > 0) this.logger.log(`summarized ${clinics} clinic-day(s)`);
+    // A throw inside a scheduled job has no caller to catch it: it becomes an
+    // unhandled rejection, which the process handler logs as a bare stack with
+    // nothing naming the job. The next night's run is unaffected, so the only
+    // thing lost by containing it here is the noise — and the only thing gained
+    // by NOT containing it is a chance the process handler changes to exit.
+    try {
+      const { clinics } = await this.runDailySummary();
+      if (clinics > 0) this.logger.log(`summarized ${clinics} clinic-day(s)`);
+    } catch (err) {
+      this.logger.error(
+        `daily summary failed: ${err instanceof Error ? err.message : String(err)}`,
+        err instanceof Error ? err.stack : undefined,
+      );
+    }
   }
 
   /**

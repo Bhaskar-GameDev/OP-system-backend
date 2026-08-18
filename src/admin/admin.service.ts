@@ -29,63 +29,13 @@ import {
   toAdminDoctorSession,
   toAdminStaff,
 } from './admin.dto';
+import { CLINIC_SELECT, DOCTOR_SELECT, SESSION_SELECT, STAFF_SELECT } from './admin.selects';
+import { req, positiveFee, parseStartTime, parseMaxTokens, parseDays, notFoundIfMissing } from './admin.validators';
 
 // Query-layer allow-lists: password material is NEVER fetched, so it cannot
 // leak regardless of downstream handling (defense-in-depth with the DTO
 // mappers). Note loginCredentials/passwordHash are absent by construction.
-const CLINIC_SELECT = {
-  id: true,
-  name: true,
-  address: true,
-  contactNumber: true,
-} satisfies Prisma.ClinicSelect;
 
-const DOCTOR_SELECT = {
-  id: true,
-  clinicId: true,
-  name: true,
-  specialization: true,
-  consultationFee: true,
-  avgConsultMinutes: true,
-  photoUrl: true,
-  username: true,
-  // Both feed admin-only flags (canSignIn / sessionCount) so a half-configured
-  // doctor is visible on the admin screen rather than discovered by a patient.
-  // `toAdminDoctor` reduces the hash to a boolean — it is never sent to a client.
-  passwordHash: true,
-  _count: { select: { sessions: true } },
-} satisfies Prisma.DoctorSelect;
-
-const SESSION_SELECT = {
-  id: true,
-  doctorId: true,
-  sessionType: true,
-  startTime: true,
-  maxTokens: true,
-  daysOfWeek: true,
-} satisfies Prisma.DoctorSessionSelect;
-
-const STAFF_SELECT = {
-  id: true,
-  clinicId: true,
-  name: true,
-  role: true,
-  username: true,
-} satisfies Prisma.StaffSelect;
-
-/**
- * Admin Portal CRUD. EVERY method is scoped to the caller's own clinicId, which
- * the controller derives from the authenticated admin's JWT — never from a
- * request parameter. A clinicId in a request body is only ever used to CONFIRM
- * it matches the token (assertClinic); a mismatch is 403, never a scope switch.
- *
- * For edit/delete of an existing doctor/staff row, scope is re-checked against
- * the LOADED row's clinicId: an admin from Clinic A passing Clinic B's real
- * doctor id gets 403, because that doctor's clinicId != the token's clinicId.
- *
- * No clinic-creation endpoint exists — onboarding is a seed script. Clinic
- * management is edit-only, scoped to the admin's own clinic.
- */
 @Injectable()
 export class AdminService {
   constructor(
@@ -479,56 +429,4 @@ export class AdminService {
     }
     return staff;
   }
-}
-
-function req(v: string | undefined, field: string): string {
-  if (v === undefined || v.trim() === '') {
-    throw new BadRequestException(`${field} is required`);
-  }
-  return v;
-}
-
-/** Consultation fee must be a positive integer (in rupees). */
-function positiveFee(v: number | undefined): number | undefined {
-  if (v === undefined) return undefined;
-  if (!Number.isInteger(v) || v <= 0) {
-    throw new BadRequestException('consultationFee must be a positive integer');
-  }
-  return v;
-}
-
-function parseStartTime(v: string): string {
-  if (typeof v !== 'string' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(v)) {
-    throw new BadRequestException('startTime must be "HH:MM" (24h)');
-  }
-  return v;
-}
-
-function parseMaxTokens(v: number): number {
-  if (!Number.isInteger(v) || v <= 0) {
-    throw new BadRequestException('maxTokens must be a positive integer');
-  }
-  return v;
-}
-
-function parseDays(v: number[]): number[] {
-  if (!Array.isArray(v) || v.length === 0) {
-    throw new BadRequestException('daysOfWeek must be a non-empty array');
-  }
-  for (const d of v) {
-    if (!Number.isInteger(d) || d < 0 || d > 6) {
-      throw new BadRequestException('daysOfWeek entries must be integers 0–6 (Sun–Sat)');
-    }
-  }
-  return [...new Set(v)].sort((a, b) => a - b);
-}
-
-function notFoundIfMissing(e: unknown, message: string): unknown {
-  if (
-    e instanceof Prisma.PrismaClientKnownRequestError &&
-    e.code === 'P2025' // record not found
-  ) {
-    return new NotFoundException(message);
-  }
-  return e;
 }

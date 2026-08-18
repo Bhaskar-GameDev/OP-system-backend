@@ -3,6 +3,7 @@ import {
   Logger,
   OnModuleDestroy,
   OnModuleInit,
+  UseFilters,
 } from '@nestjs/common';
 import {
   OnGatewayConnection,
@@ -21,12 +22,23 @@ import {
 import { SessionRevocationService } from '../auth/session-revocation.service';
 import { parseCorsOrigins } from '../common/config/cors-origins';
 import { MetricsService } from '../common/observability/metrics.service';
+import { WsExceptionsFilter } from '../common/errors/ws-exceptions.filter';
 import { DisplayService } from '../display/display.service';
 import { QueueReadService } from '../read-side/queue-read.service';
 import { EtaService } from './eta.service';
 import { QueueService } from './queue.service';
 import { QueueEventsService } from './queue-events.service';
 import { SessionKey } from './token.service';
+import {
+  sessionRoom,
+  bookingRoom,
+  displayRoom,
+  OP_SESSION_PREFIX,
+  OP_ENCOUNTER_PREFIX,
+  opSessionRoom,
+  opEncounterRoom,
+} from './queue.rooms';
+import { extractDisplayClinic, extractToken } from './socket-identity';
 
 interface JoinPayload {
   doctorId: string;
@@ -34,20 +46,6 @@ interface JoinPayload {
   sessionType: 'MORNING' | 'EVENING';
   token?: string; // patients only — their own token
 }
-
-const sessionRoom = (s: SessionKey): string =>
-  `session:${s.doctorId}:${s.sessionDate}:${s.sessionType}`;
-const bookingRoom = (bookingId: string): string => `booking:${bookingId}`;
-const displayRoom = (clinicId: string): string => `display:${clinicId}`;
-
-// New token-engine realtime rooms (Task 3), additive alongside the legacy rooms
-// above so the existing app contract is untouched.
-const OP_SESSION_PREFIX = 'op-session:';
-const OP_ENCOUNTER_PREFIX = 'op-encounter:';
-const opSessionRoom = (opSessionId: string): string =>
-  `${OP_SESSION_PREFIX}${opSessionId}`;
-const opEncounterRoom = (encounterId: string): string =>
-  `${OP_ENCOUNTER_PREFIX}${encounterId}`;
 
 /** How often live sockets are re-checked for an expired or revoked session. */
 const SESSION_SWEEP_INTERVAL_MS = 60_000;
@@ -80,6 +78,11 @@ interface OpJoinPayload {
  * cannot drift apart again.
  */
 @WebSocketGateway({ cors: { origin: parseCorsOrigins(process.env.CORS_ORIGINS) } })
+// Every handler below guards the failures it expects and answers with an
+// `error` event. This catches the ones it does not: without it an unexpected
+// throw (a Prisma timeout, a malformed payload) left the client with no reply
+// at all, staring at a dashboard that never populated. See ws-exceptions.filter.
+@UseFilters(new WsExceptionsFilter())
 export class QueueGateway
   implements OnGatewayConnection, OnModuleInit, OnModuleDestroy
 {
@@ -198,6 +201,21 @@ export class QueueGateway
    */
   @Interval(SESSION_SWEEP_INTERVAL_MS)
   async sweepExpiredSockets(): Promise<void> {
+    // Scheduled, so there is no caller to catch anything that escapes the loop
+    // below — and a sweep that dies silently stops evicting revoked sessions,
+    // which is a security control, not a convenience. Failing loudly once a
+    // minute is the point.
+    try {
+      await this.runSessionSweep();
+    } catch (err) {
+      this.logger.error(
+        `session sweep failed: ${err instanceof Error ? err.message : String(err)}`,
+        err instanceof Error ? err.stack : undefined,
+      );
+    }
+  }
+
+  private async runSessionSweep(): Promise<void> {
     if (!this.server) return;
     for (const client of this.server.sockets.sockets.values()) {
       const claims = client.data.claims as SessionClaims | undefined;
@@ -569,32 +587,3 @@ export class QueueGateway
  * Requires an explicit `display: true` alongside the id so an authenticated
  * client cannot fall into the unauthenticated path by passing a stray param.
  */
-function extractDisplayClinic(client: Socket): string | null {
-  const auth = client.handshake.auth as
-    | { display?: unknown; clinicId?: unknown }
-    | undefined;
-  if (auth?.display === true && typeof auth.clinicId === 'string') {
-    return auth.clinicId;
-  }
-  const q = client.handshake.query ?? {};
-  if (q.display === 'true' && typeof q.clinicId === 'string') {
-    return q.clinicId;
-  }
-  return null;
-}
-
-/**
- * Session token from the handshake — `auth` payload or Authorization header.
- *
- * The query-string fallback was removed deliberately. A credential in a query
- * string is written to proxy access logs, browser history and referrer headers,
- * which are not places designed to hold one, and every client here already
- * sends the token in the handshake `auth` payload.
- */
-function extractToken(client: Socket): string {
-  const auth = client.handshake.auth as { token?: string } | undefined;
-  if (auth?.token) return auth.token;
-  const header = client.handshake.headers.authorization;
-  if (header?.startsWith('Bearer ')) return header.slice(7);
-  throw new Error('no token');
-}

@@ -14,6 +14,7 @@ import {
   toPublicDoctorSchedule,
   toPublicSessionTemplate,
 } from './discovery.dto';
+import { ymdLocal } from '../common/dates';
 
 const DEFAULT_PAGE_SIZE = 20;
 const MAX_PAGE_SIZE = 50;
@@ -224,9 +225,3 @@ function startOfLocalDay(at: Date): Date {
 }
 
 /** Local-calendar YYYY-MM-DD (never UTC — avoids the date rolling back a day). */
-function ymdLocal(d: Date): string {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
-}

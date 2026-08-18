@@ -25,11 +25,6 @@ export function runWithRequestContext<T>(context: RequestContext, fn: () => T): 
   return storage.run(context, fn);
 }
 
-/** The active context, or undefined outside a request (cron jobs, sockets). */
-export function currentRequestContext(): RequestContext | undefined {
-  return storage.getStore();
-}
-
 /** The active request id, or undefined outside a request. */
 export function currentRequestId(): string | undefined {
   return storage.getStore()?.requestId;

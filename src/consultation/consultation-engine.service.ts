@@ -22,7 +22,6 @@ import { OpSessionService } from '../queue/op-session.service';
 import { QueuePolicyService } from '../queue/queue-policy.service';
 import { EncounterService } from '../encounters/encounter.service';
 import { CheckInService } from '../check-in/checkin.service';
-import { TokenSeriesService } from '../tokens/token-series.service';
 
 export interface CallResult {
   candidate: QueueCandidate;
@@ -48,7 +47,6 @@ export class ConsultationEngineService {
     private readonly policies: QueuePolicyService,
     private readonly encounters: EncounterService,
     private readonly checkins: CheckInService,
-    private readonly tokens: TokenSeriesService,
   ) {}
 
   /**
