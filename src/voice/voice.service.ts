@@ -45,6 +45,41 @@ import { matchesSpecialty } from './specialty-match';
 // Statuses a caller can still act on over the phone (token issued, in play).
 const LIVE_STATUSES: BookingStatus[] = [BookingStatus.BOOKED, BookingStatus.ACTIVE];
 
+/** Longest name we will store from a voice call. A first name is all the desk needs. */
+const MAX_PATIENT_NAME = 60;
+
+/**
+ * Clean a patient name that came off a phone call.
+ *
+ * The voice agent asks "may I have your name for the token?" and whatever the
+ * caller says is transcribed and slot-extracted into this field. That path is
+ * caller-controlled free text arriving at a database write, so it gets the
+ * treatment any such field gets:
+ *
+ *  - length capped, so a rambling answer or a hostile one cannot fill a column;
+ *  - control characters stripped, since the value is rendered on the reception and
+ *    doctor desks and read aloud by TTS;
+ *  - restricted to letters (including Telugu and Devanagari), spaces, apostrophes,
+ *    hyphens and dots — the punctuation real Indian names actually use.
+ *
+ * Returns undefined when nothing usable is left, which the caller treats exactly
+ * like "no name given": the token is still issued. A booking is never held hostage
+ * over a name.
+ */
+export function sanitizePatientName(raw?: string | null): string | undefined {
+  if (!raw) return undefined;
+  const cleaned = raw
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    // Latin, Telugu (0C00-0C7F) and Devanagari (0900-097F), plus name punctuation.
+    .replace(/[^\p{L}\p{M} '.\-]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, MAX_PATIENT_NAME)
+    .trim();
+  return cleaned.length >= 2 ? cleaned : undefined;
+}
+
 /**
  * Voice (phone) booking API. The voice agent holds no DB — every state change
  * goes through here, reusing the SAME atomic token/queue engine the app and
@@ -216,10 +251,16 @@ export class VoiceService {
       throw new ConflictException('the requested session is not the one open now');
     }
 
+    // The name arrives from a speech-to-text transcript of whatever the caller
+    // said, by way of an LLM slot extraction. It is the one field on this endpoint
+    // that is free text under the caller's control, and it lands in a patient
+    // record that reception reads off a screen — so it is sanitised here, at the
+    // trust boundary, rather than anywhere upstream.
+    const patientName = sanitizePatientName(req.patientName);
     const patient = await this.prisma.patient.upsert({
       where: { mobile: req.patientPhone },
-      create: { mobile: req.patientPhone, name: req.patientName ?? '' },
-      update: req.patientName ? { name: req.patientName } : {},
+      create: { mobile: req.patientPhone, name: patientName ?? '' },
+      update: patientName ? { name: patientName } : {},
       select: { id: true },
     });
 
@@ -275,7 +316,7 @@ export class VoiceService {
       doctorId: req.doctorId,
       patientId: patient.id,
       mobile: req.patientPhone,
-      name: req.patientName ?? undefined,
+      name: patientName ?? undefined,
       serviceDate: resolved.sessionDate,
       idempotencyKey: req.callSid,
       legacyBookingId: booking.id,
