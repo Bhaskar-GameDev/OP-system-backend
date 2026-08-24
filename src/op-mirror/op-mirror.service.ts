@@ -19,6 +19,13 @@ export interface MirrorInput {
   idempotencyKey: string;
   /** Legacy bookingId, stored in channelMeta so Task 5 backfill can correlate. */
   legacyBookingId?: string;
+  /**
+   * Name the caller/desk stated for THIS booking. Recorded on the registration
+   * rather than written onto the patient, because identity is the mobile and one
+   * phone is routinely shared across a family — overwriting patients.name
+   * renamed tokens that were already issued to someone else.
+   */
+  bookedName?: string;
   actorId?: string;
   /**
    * Reception combined desk path only: the patient is physically present, so
@@ -64,9 +71,15 @@ export class OpMirrorService {
         serviceDate: input.serviceDate,
         actorId: input.actorId,
         idempotencyKey: input.idempotencyKey,
-        channelMeta: input.legacyBookingId
-          ? { legacyBookingId: input.legacyBookingId }
-          : undefined,
+        channelMeta:
+          input.legacyBookingId || input.bookedName
+            ? {
+                ...(input.legacyBookingId
+                  ? { legacyBookingId: input.legacyBookingId }
+                  : {}),
+                ...(input.bookedName ? { bookedName: input.bookedName } : {}),
+              }
+            : undefined,
       });
 
       if (input.present) {

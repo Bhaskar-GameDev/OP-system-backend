@@ -257,12 +257,30 @@ export class VoiceService {
     // record that reception reads off a screen — so it is sanitised here, at the
     // trust boundary, rather than anywhere upstream.
     const patientName = sanitizePatientName(req.patientName);
-    const patient = await this.prisma.patient.upsert({
+    // Fill the patient's name only when we do not have one. It must NOT be
+    // overwritten: identity here is the MOBILE, and one phone per household is
+    // normal — a father books for himself, calls back to book for his son, and
+    // the son's name used to land on the father's record, renaming a token that
+    // was already issued and already on the reception roster. Reception then
+    // calls out the wrong name and the audit trail loses who the earlier token
+    // was for. The name stated on THIS call is recorded per-registration below
+    // instead, which is where a per-booking name belongs.
+    const existingPatient = await this.prisma.patient.findUnique({
       where: { mobile: req.patientPhone },
-      create: { mobile: req.patientPhone, name: patientName ?? '' },
-      update: patientName ? { name: patientName } : {},
-      select: { id: true },
+      select: { id: true, name: true },
     });
+    const patient = existingPatient
+      ? existingPatient.name.trim()
+        ? { id: existingPatient.id }
+        : await this.prisma.patient.update({
+            where: { id: existingPatient.id },
+            data: { name: patientName ?? '' },
+            select: { id: true },
+          })
+      : await this.prisma.patient.create({
+          data: { mobile: req.patientPhone, name: patientName ?? '' },
+          select: { id: true },
+        });
 
     // Abuse guard: one live token per caller per doctor-session. A repeat call
     // (different callSid) for a doctor they already hold a token with returns the
@@ -317,6 +335,10 @@ export class VoiceService {
       patientId: patient.id,
       mobile: req.patientPhone,
       name: patientName ?? undefined,
+      // The name as stated on THIS call, kept beside the registration so a
+      // per-booking name survives even when patients.name belongs to someone
+      // else on the same phone.
+      bookedName: patientName ?? undefined,
       serviceDate: resolved.sessionDate,
       idempotencyKey: req.callSid,
       legacyBookingId: booking.id,

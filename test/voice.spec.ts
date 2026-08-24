@@ -351,7 +351,7 @@ describe('Voice API (/voice) — real infra', () => {
     const wrongCaller = await voice('/voice/appointments/cancel', {
       didNumber: DID,
       patientPhone: '9399999999',
-      appointmentId: booking.id,
+      appointmentId: booking.bookingId,
     });
     expect(wrongCaller.status).toBe(404);
 
@@ -359,17 +359,78 @@ describe('Voice API (/voice) — real infra', () => {
     const otherDid = await voice('/voice/appointments/cancel', {
       didNumber: '+919999999999',
       patientPhone: PHONE,
-      appointmentId: booking.id,
+      appointmentId: booking.bookingId,
     });
     expect(otherDid.status).toBe(404);
 
     // scope is mandatory: an id on its own is rejected outright
-    const noScope = await voice('/voice/appointments/cancel', { appointmentId: booking.id });
+    const noScope = await voice('/voice/appointments/cancel', { appointmentId: booking.bookingId });
     expect(noScope.status).toBe(400);
 
     // and the booking is untouched by any of the three
-    const row = await prisma.booking.findUniqueOrThrow({ where: { id: booking.id } });
+    const row = await prisma.booking.findUniqueOrThrow({ where: { id: booking.bookingId } });
     expect(row.status).toBe(BookingStatus.BOOKED);
+  });
+
+  /**
+   * One phone, two people. Identity here is the MOBILE, and a shared household
+   * phone is normal — so a later caller stating a different name must not rename
+   * the patient whose token is already issued and already on the reception
+   * roster. A live call did exactly that: token N001 was booked for one name and
+   * then displayed under another.
+   */
+  it('a later stated name does not overwrite the patient it belongs to', async () => {
+    const phone = '9300009003';
+    const first = await voice('/voice/bookings', {
+      didNumber: DID,
+      doctorId: DOCTOR,
+      sessionType: 'MORNING',
+      patientPhone: phone,
+      patientName: 'First Caller',
+      callSid: 'call-name-1',
+    });
+    expect(first.status).toBe(201);
+    const firstBody = (await first.json()) as { tokenNumber: string };
+
+    const patientAfterFirst = await prisma.patient.findUniqueOrThrow({
+      where: { mobile: phone },
+      select: { id: true, name: true },
+    });
+    expect(patientAfterFirst.name).toBe('First Caller');
+
+    // Same phone, same doctor, same day, DIFFERENT stated name. Dedup returns the
+    // held booking — and the name on record must be untouched.
+    const second = await voice('/voice/bookings', {
+      didNumber: DID,
+      doctorId: DOCTOR,
+      sessionType: 'MORNING',
+      patientPhone: phone,
+      patientName: 'Second Caller',
+      callSid: 'call-name-2',
+    });
+    expect(second.status).toBe(201);
+    const secondBody = (await second.json()) as { bookingId: string; tokenNumber: string };
+
+    const patientAfterSecond = await prisma.patient.findUniqueOrThrow({
+      where: { mobile: phone },
+      select: { name: true },
+    });
+    expect(patientAfterSecond.name).toBe('First Caller');
+
+    // The name stated on the booking call is still recorded — on the
+    // registration, which is where a per-booking name belongs.
+    const encounter = await prisma.encounter.findFirst({
+      where: { patientId: patientAfterFirst.id },
+      select: { id: true },
+    });
+    expect(encounter).not.toBeNull();
+    const registration = await prisma.registration.findFirstOrThrow({
+      where: { encounterId: encounter!.id },
+      select: { channelMeta: true },
+    });
+    expect((registration.channelMeta as { bookedName?: string }).bookedName).toBe('First Caller');
+    // Dedup: the same held token, not a second one.
+    expect(secondBody.tokenNumber).toBe(firstBody.tokenNumber);
   });
 
   it('call-logs persists idempotently by callSid', async () => {
